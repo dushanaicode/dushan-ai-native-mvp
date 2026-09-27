@@ -1,0 +1,274 @@
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+
+import pytest
+from fastapi import APIRouter, Body, File, UploadFile
+from pydantic import BaseModel
+
+from framework.common.exception.constants.global_error_code_constants import (
+    GlobalErrorCodeConstants,
+)
+from framework.common.exception.exceptions.base_business_exception import BaseBusinessException
+from framework.starter_di.context.get_bean import get_bean
+from framework.starter_security.bizlog.biz_log_service import BizLogService
+from framework.starter_security.bizlog.diff_field import DiffField
+from framework.starter_security.bizlog.log_record import log_record
+from framework.starter_security.bizlog.log_record_spec import LogRecordSpec
+from framework.starter_security.definitions.constants.security_error_codes import SecurityErrorCodes
+from framework.starter_security.definitions.enums.security_realm import SecurityRealm
+from framework.starter_security.exception.security_exception import SecurityException
+from framework.starter_security.model.workload_identity import WorkloadIdentity
+from framework.starter_security.spi.workload_provider import WorkloadProvider
+from framework.starter_web.routing.route_policy import RoutePolicy
+
+from .test_workload import WorkloadProofs
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [RoutePolicy.public(), RoutePolicy(("read",)), RoutePolicy(("admin",), permission_mode="any")],
+)
+@pytest.mark.parametrize("nested", [False, True])
+async def test_outer_route_policy_cannot_be_replaced(security_factory, inner, nested):
+    router = APIRouter()
+    RoutePolicy(("admin",))(router)
+    child = APIRouter()
+    if nested:
+        inner(child)
+        child.add_api_route("/protected", lambda: {"leak": True})
+    else:
+        child.add_api_route("/protected", inner(lambda: {"leak": True}))
+    router.include_router(child)
+    with pytest.raises(Exception) as raised:
+        async with security_factory(router=router):
+            pytest.fail("声明冲突不能上线")
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "外层与内层访问声明冲突" in str(raised.value.__cause__)
+
+
+async def test_unknown_domain_fails_before_ready(security_factory):
+    with pytest.raises(Exception):
+        async with security_factory(policy=RoutePolicy(domain="adimn")):
+            pytest.fail("未知认证域不能发布")
+
+
+@pytest.mark.parametrize("kind", ["method", "mro"])
+async def test_controller_and_mro_policy_conflicts(config_dir, module_package, kind):
+    from server.starter_server import create_app
+
+    source = """
+from framework.starter_web.routing.decorators import controller, route
+from framework.starter_web.routing.route_policy import RoutePolicy
+
+@controller('/base', policy=RoutePolicy(('admin',)))
+class Base:
+    @route('/item', policy=METHOD_POLICY)
+    async def item(self): return {'leak': True}
+""".replace("METHOD_POLICY", "RoutePolicy.public()" if kind == "method" else "None")
+    if kind == "mro":
+        source += "\n@controller('/child', policy=RoutePolicy.public())\nclass Child(Base): pass\n"
+    package = "security_controller_" + kind
+    module_package(package, files={"controllers.py": source})
+    app = create_app(
+        base_dir=config_dir(
+            {"modules": {"packages": ["framework", package], "enabled": ["framework", package]}}
+        ),
+        environ={},
+        access_provider=lambda: None,
+    )
+    with pytest.raises(Exception) as raised:
+        async with app.router.lifespan_context(app):
+            pytest.fail("控制器/MRO 的保护声明不能被削弱")
+    assert "访问声明冲突" in str(raised.value.__cause__)
+    assert app.state.application_context is None
+
+
+async def test_provider_business_rejection_preserves_contract(security_factory):
+    class DeniedDataAccess:
+        @asynccontextmanager
+        async def enter(self, session):
+            raise BaseBusinessException(GlobalErrorCodeConstants.FORBIDDEN, msg="访问范围已停用")
+            yield
+
+    async with security_factory(policy=RoutePolicy(realm=SecurityRealm.ACCOUNT)) as case:
+        case.service._data_access = DeniedDataAccess()
+        token, _ = await case.issue(realm=SecurityRealm.ACCOUNT)
+        response = await case.get(token)
+        assert response.json()["code"] == 403 and response.json()["message"] == "访问范围已停用"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"account_enabled": False},
+        {"current_credential_revision": 2},
+        {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
+        {"revoked": True},
+    ],
+)
+async def test_logout_revokes_even_when_login_admission_fails(security_factory, invalid):
+    async with security_factory() as case:
+        token, session = await case.issue()
+        await case.change(session, **invalid)
+        with case.application.execution():
+            await case.service.logout(token)
+            current = await case.service.tokens.resolve(
+                session.token_digest, application_id=session.application_id, domain=session.domain
+            )
+        assert current.revoked
+        await case.change(
+            current,
+            account_enabled=True,
+            current_credential_revision=1,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        assert (await case.get(token)).json()["code"] == SecurityErrorCodes.REVOKED.code
+
+
+class RegisteredJobs(WorkloadProvider):
+    async def authenticate(self, source, *, application_id, domain, capability):
+        if source != "log-cleanup" or capability != "logs:cleanup":
+            raise SecurityException(SecurityErrorCodes.DENIED)
+        return WorkloadIdentity(
+            application_id=application_id,
+            domain=domain,
+            service_id="maintenance",
+            audience=source,
+            capabilities=frozenset({capability}),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+
+
+async def test_local_job_authentication_global_scope_and_private_install(security_factory):
+    async with security_factory(workloads=RegisteredJobs()) as case:
+        assert not hasattr(case.service.context, "install_workload")
+        assert not hasattr(case.service.context, "install")
+        assert not hasattr(case.service.context, "scope")
+
+        async def run():
+            identity = case.service.context.current_workload()
+            assert identity.service_id == "maintenance"
+            assert case.service.context.current() is None
+            assert case.service.context.get_current_account_id() is None
+            return "done"
+
+        assert (
+            await case.service.run_workload("log-cleanup", run, capability="logs:cleanup") == "done"
+        )
+        token, _ = await case.issue(realm=SecurityRealm.ACCOUNT)
+        with case.application.execution():
+            async with case.service.authorized(token, RoutePolicy(realm=SecurityRealm.ACCOUNT)):
+                assert (
+                    await case.service.run_workload("log-cleanup", run, capability="logs:cleanup")
+                    == "done"
+                )
+        with pytest.raises(SecurityException):
+            await case.service.run_workload("unregistered", run, capability="logs:cleanup")
+        assert case.service.context.current_workload() is None
+
+
+async def test_message_must_match_issued_capability_not_broad_identity(security_factory):
+    messages = WorkloadProofs()
+    async with security_factory(messages=messages) as case:
+        identity = WorkloadIdentity(
+            application_id=case.service.settings.application_id,
+            domain="admin",
+            service_id="worker",
+            audience="messages",
+            capabilities=frozenset({"dispatch", "purge"}),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        proof = messages.add(identity, capability="dispatch")
+
+        async def forbidden(payload):
+            pytest.fail("dispatch 消息不能执行 purge")
+
+        with pytest.raises(SecurityException, match="权限"):
+            await case.service.run_workload_message(
+                proof, b"body", forbidden, audience="messages", capability="purge"
+            )
+
+
+async def test_roles_and_scopes_have_explicit_any_mode(security_factory):
+    policy = RoutePolicy(
+        roles=("admin", "reader"), scopes=("email", "profile"), role_mode="any", scope_mode="any"
+    )
+    async with security_factory(policy=policy) as case:
+        good, _ = await case.issue()
+        denied, _ = await case.issue(roles=("guest",))
+        assert (await case.get(good)).json()["account"] == "account-1"
+        assert (await case.get(denied)).json()["code"] == SecurityErrorCodes.DENIED.code
+
+
+@pytest.mark.parametrize("kind", ["json", "multipart"])
+async def test_unauthenticated_body_is_not_consumed(security_factory, kind):
+    router = APIRouter()
+    if kind == "json":
+
+        async def endpoint(body: dict = Body(...)):
+            return body
+
+        media_type = "application/json"
+    else:
+
+        async def endpoint(file: UploadFile = File(...)):
+            return {"name": file.filename}
+
+        media_type = "multipart/form-data; boundary=attack"
+    router.add_api_route("/protected", RoutePolicy(("admin",))(endpoint), methods=["POST"])
+    async with security_factory(router=router) as case:
+        token, _ = await case.issue()
+        consumed = []
+
+        async def content():
+            consumed.append(True)
+            yield b"malformed body that must not be read"
+
+        for headers, code in (
+            ({}, SecurityErrorCodes.MISSING.code),
+            ({"Authorization": "Bearer " + token}, SecurityErrorCodes.DENIED.code),
+        ):
+            response = await case.client.post(
+                "/protected", headers={"Content-Type": media_type, **headers}, content=content()
+            )
+            assert response.json()["code"] == code
+            assert consumed == []
+
+
+async def test_diff_and_request_projection_reach_persistent_audit(security_factory):
+    class Item(BaseModel):
+        value: Annotated[str, DiffField("值")]
+
+    router = APIRouter()
+
+    @log_record(LogRecordSpec("item", "update", "{{ diff }}", "42"))
+    async def endpoint(identifier: str):
+        await get_bean(BizLogService).record_diff(Item(value="old"), Item(value="new"))
+        return {"updated": True}
+
+    router.add_api_route("/items/{identifier}", RoutePolicy()(endpoint))
+    async with security_factory(router=router, audit=True) as case:
+        token, _ = await case.issue()
+        response = await case.get(
+            token,
+            path="/items/private-path?token=private-query",
+            headers={
+                "User-Agent": "Browser/" + token + " password=private-pass",
+                "X-Forwarded-For": "198.51.100.1",
+            },
+        )
+        assert response.json()["updated"]
+        with case.application.execution():
+            service = case.application.get_bean(BizLogService)
+        event = service.provider.events[-1]
+        assert "old" in event.action and "new" in event.action
+        assert event.operation.request.request_method == "GET"
+        assert event.operation.request.request_url == "/items/{identifier}"
+        assert event.operation.request.user_ip == "127.0.0.1"
+        encoded = str(event.operation.request)
+        assert "private" not in encoded and token not in encoded
+        assert (
+            token not in event.operation.request.user_agent
+            and "private-pass" not in event.operation.request.user_agent
+        )

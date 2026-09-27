@@ -1,0 +1,5 @@
+name = "web_http_feature"
+package = "fixtures.web_http_feature"
+scan_roots = ["."]
+definitions = []
+requires = ["framework"]
