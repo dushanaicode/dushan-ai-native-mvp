@@ -1,0 +1,154 @@
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+
+from framework.common.contracts import SnowflakeIdStr
+from framework.common.enums import StatusEnum
+from framework.common.page import PageResult, PageSettings
+from framework.common.schemas.request import IdListReqVO, IdReqVO, UpdateStatusReqVO
+from framework.common.utils import ConversionUtils
+from framework.starter_di.public import (
+    DiDependency,
+)
+from framework.starter_excel.public import (
+    DictDataProvider,
+    ExcelProviders,
+    ExcelWriter,
+)
+from framework.starter_security.public import (
+    SecurityRealm,
+)
+from framework.starter_web.public import (
+    FileResult,
+    Result,
+    RoutePolicy,
+)
+from module_system.controller.admin.dept.vo.post.post_export_req_vo import PostExportReqVO
+from module_system.controller.admin.dept.vo.post.post_page_req_vo import PostPageReqVO
+from module_system.controller.admin.dept.vo.post.post_resp_vo import PostRespVO
+from module_system.controller.admin.dept.vo.post.post_save_req_vo import PostSaveReqVO
+from module_system.controller.admin.dept.vo.post.post_simple_resp_vo import PostSimpleRespVO
+from module_system.dal.dataobject.dept.post_do import PostDO
+from module_system.service.dept.post_service import PostService
+from module_system.spi.dept.dept_info_provider_adapter import DeptInfoProviderAdapter
+from module_system.spi.dept.post_info_provider_adapter import PostInfoProviderAdapter
+
+post_controller = APIRouter(prefix="/dept/post", tags=["System - 岗位管理"])
+
+
+class PostController:
+    @staticmethod
+    @post_controller.post("/create", summary="创建岗位")
+    @RoutePolicy(permissions=("system:dept:post:create",), realm=SecurityRealm.ACCOUNT)
+    async def create_post(
+        create_req_vo: PostSaveReqVO,
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[SnowflakeIdStr]:
+        id = await post_service.create_post(create_req_vo)
+        return Result.success(data=id)
+
+    @staticmethod
+    @post_controller.put("/update", summary="修改岗位")
+    @RoutePolicy(permissions=("system:dept:post:update",), realm=SecurityRealm.ACCOUNT)
+    async def update_post(
+        update_req_vo: PostSaveReqVO,
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[bool]:
+        await post_service.update_post(update_req_vo)
+        return Result.success(data=True)
+
+    @staticmethod
+    @post_controller.put("/update-status", summary="修改岗位状态")
+    @RoutePolicy(permissions=("system:dept:post:update",), realm=SecurityRealm.ACCOUNT)
+    async def update_post_status(
+        req_vo: UpdateStatusReqVO,
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[bool]:
+        await post_service.update_status(req_vo.id, req_vo.status)
+        return Result.success(data=True)
+
+    @staticmethod
+    @post_controller.delete("/delete", summary="删除岗位")
+    @RoutePolicy(permissions=("system:dept:post:delete",), realm=SecurityRealm.ACCOUNT)
+    async def delete_post(
+        req_vo: IdReqVO = Query(),
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[bool]:
+        await post_service.delete_post(req_vo.id)
+        return Result.success(data=True)
+
+    @staticmethod
+    @post_controller.delete("/delete-list", summary="批量删除岗位")
+    @RoutePolicy(permissions=("system:dept:post:delete",), realm=SecurityRealm.ACCOUNT)
+    async def delete_post_batch(
+        req_vo: IdListReqVO = Query(),
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[int]:
+        deleted_count = await post_service.delete_post_batch(req_vo.ids)
+        return Result.success(data=deleted_count)
+
+    @staticmethod
+    @post_controller.get("/get", summary="获得岗位信息")
+    @RoutePolicy(permissions=("system:dept:post:query",), realm=SecurityRealm.ACCOUNT)
+    async def get_post(
+        req_vo: IdReqVO = Query(),
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[PostRespVO]:
+        post = await post_service.get_post(req_vo.id)
+        return Result.success(data=PostRespVO.model_validate(post))
+
+    @staticmethod
+    @post_controller.get("/simple-list", summary="获取岗位全列表")
+    @RoutePolicy(realm=SecurityRealm.ACCOUNT)
+    async def get_simple_post_list(
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[list[PostSimpleRespVO]]:
+        posts = await post_service.get_post_list(None, [StatusEnum.ENABLE.code])
+        posts = sorted(posts, key=lambda x: x.sort)
+        return Result.success(data=[PostSimpleRespVO.model_validate(post) for post in posts])
+
+    @staticmethod
+    @post_controller.get("/page", summary="获得岗位分页列表")
+    @RoutePolicy(permissions=("system:dept:post:query",), realm=SecurityRealm.ACCOUNT)
+    async def get_post_page(
+        page_req_vo: PostPageReqVO = Query(),
+        post_service: PostService = Depends(DiDependency(PostService)),
+    ) -> Result[PageResult[PostRespVO]]:
+        page_result: PageResult[PostDO] = await post_service.get_post_page(page_req_vo)
+        resp_vo: PageResult[PostRespVO] = page_result.convert(PostRespVO)
+        return Result.success(data=resp_vo)
+
+    @staticmethod
+    @post_controller.get("/export-fields", summary="获取岗位可导出字段列表")
+    @RoutePolicy(permissions=("system:dept:post:export",), realm=SecurityRealm.ACCOUNT)
+    async def get_export_post_fields() -> Result[list[dict[str, str]]]:
+        export_fields = ExcelWriter.export_fields(PostRespVO)
+        return Result.success(data=export_fields)
+
+    @staticmethod
+    @post_controller.get("/export-excel", summary="导出岗位", response_class=StreamingResponse)
+    @RoutePolicy(permissions=("system:dept:post:export",), realm=SecurityRealm.ACCOUNT)
+    async def export_post(
+        page_req_vo: PostExportReqVO = Query(),
+        post_service: PostService = Depends(DiDependency(PostService)),
+        excel_writer: ExcelWriter = Depends(DiDependency(ExcelWriter)),
+        files: FileResult = Depends(DiDependency(FileResult)),
+        dictionaries: DictDataProvider = Depends(DiDependency(DictDataProvider)),
+        departments: DeptInfoProviderAdapter = Depends(DiDependency(DeptInfoProviderAdapter)),
+        posts: PostInfoProviderAdapter = Depends(DiDependency(PostInfoProviderAdapter)),
+        page_settings: PageSettings = Depends(DiDependency(PageSettings)),
+    ) -> StreamingResponse:
+        excel_providers = ExcelProviders(
+            dictionaries=dictionaries, departments=departments, posts=posts
+        )
+        page_req_vo.enable_fetch_all(
+            max_rows=min(excel_writer.settings.max_export_rows, page_settings.fetch_all_max_rows)
+        )
+        page_result: PageResult[PostDO] = await post_service.get_post_page(page_req_vo)
+        excel_list: list[PostRespVO] = ConversionUtils.list_to_vo_list(
+            page_result.items, PostRespVO
+        )
+        filename = "岗位数据"
+        file_data = await excel_writer.write(
+            "数据", PostRespVO, excel_list, providers=excel_providers, fields=page_req_vo.fields
+        )
+        return files.excel_stream(file_data, file_name=f"{filename}.xlsx")

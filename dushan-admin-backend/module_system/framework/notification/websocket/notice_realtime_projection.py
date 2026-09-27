@@ -1,0 +1,22 @@
+from framework.starter_di.public import (
+    Inject,
+    service,
+)
+from framework.starter_security.public import (
+    SecurityContext,
+)
+from module_system.dal.mapper.notification.notice_message_mapper import (
+    NoticeMessageMapper,
+)
+
+
+@service
+class NoticeRealtimeProjection:
+    messages: NoticeMessageMapper = Inject()
+    security: SecurityContext = Inject()
+
+    async def project(self, payload, context):
+        entry = await self.messages.select_by_id(int(payload.message_id))
+        if entry is None or entry.user_id != int(self.security.require().account_id):
+            return None
+        return payload
