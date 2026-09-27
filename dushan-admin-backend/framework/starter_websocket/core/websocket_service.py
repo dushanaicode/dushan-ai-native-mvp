@@ -1,0 +1,120 @@
+import time
+from uuid import uuid4
+
+from pydantic import ValidationError
+
+from framework.starter_di.decorators.components import framework
+from framework.starter_websocket.definitions.constants.websocket_constants import WebSocketConstants
+from framework.starter_websocket.definitions.constants.websocket_error_codes import (
+    WebSocketErrorCodes,
+)
+from framework.starter_websocket.definitions.enums.socket_target_kind import SocketTargetKind
+from framework.starter_websocket.exception.websocket_exception import WebSocketException
+from framework.starter_websocket.model.socket_delivery import SocketDelivery
+from framework.starter_websocket.model.socket_message import SocketMessage
+from framework.starter_websocket.model.socket_receipt import SocketReceipt
+
+
+@framework
+class WebSocketService:
+    """业务仅依赖发送/在线/失效端口，不访问本地连接字典。"""
+
+    def __init__(self):
+        self.runtime = None
+
+    def require_runtime(self):
+        if self.runtime is None or not self.runtime.accepting:
+            raise WebSocketException(WebSocketErrorCodes.CLOSED)
+        return self.runtime
+
+    async def _authorize(self, target):
+        runtime = self.require_runtime()
+        audience = runtime.registry.audience(target.audience)
+        identity = runtime.security.context.current()
+        workload = runtime.security.context.current_workload()
+        if identity is not None:
+            if "send" not in await runtime.security.allowed_policies(
+                {"send": audience.send_policy}
+            ):
+                raise WebSocketException(WebSocketErrorCodes.POLICY)
+        elif workload is not None:
+            if (
+                audience.workload_capability is None
+                or audience.workload_capability not in workload.capabilities
+            ):
+                raise WebSocketException(WebSocketErrorCodes.POLICY)
+            if target.kind is SocketTargetKind.AUDIENCE and not audience.allow_global_targets:
+                raise WebSocketException(WebSocketErrorCodes.POLICY)
+        else:
+            raise WebSocketException(WebSocketErrorCodes.POLICY)
+        return runtime, identity
+
+    async def send(self, target, message):
+        runtime, identity = await self._authorize(target)
+        value = runtime.registry.event_payload(target.audience, message.type, message.payload)
+        sender = None if identity is None else identity.account_id
+        if message.sender_id is not None and message.sender_id != sender:
+            raise WebSocketException(WebSocketErrorCodes.POLICY)
+        try:
+            message = SocketMessage.model_validate_json(
+                runtime.codec.encode(
+                    message.model_copy(
+                        update={"payload": value.model_dump(mode="json"), "sender_id": sender}
+                    )
+                ),
+                by_name=False,
+            )
+        except ValidationError as error:
+            raise WebSocketException(WebSocketErrorCodes.POLICY, cause=error) from error
+        envelope = SocketDelivery(
+            version=1,
+            id=uuid4().hex,
+            instance=runtime.instance,
+            action="deliver",
+            target=target,
+            message=message,
+            family_id=None,
+            issued_at=time.time(),
+            signature="0" * 64,
+        )
+        if runtime.transport is None:
+            return SocketReceipt("local", runtime.receive_delivery(envelope))
+        return SocketReceipt("redis", await runtime.transport.publish(envelope))
+
+    async def online(self, target):
+        runtime, _ = await self._authorize(target)
+        if runtime.online is None:
+            return tuple(
+                connection.information
+                for connection in runtime.connections.values()
+                if connection.phase == "active" and runtime.matches(connection.information, target)
+            )
+        return await runtime.call(runtime.online.query(target))
+
+    async def invalidate(self, *, family_id: str):
+        """会话可失效自身；服务来源需明确的连接撤销能力。"""
+        runtime = self.require_runtime()
+        if not isinstance(family_id, str) or not family_id or family_id != family_id.strip():
+            raise WebSocketException(WebSocketErrorCodes.POLICY)
+        identity = runtime.security.context.current()
+        workload = runtime.security.context.current_workload()
+        privileged = (
+            workload is not None
+            and WebSocketConstants.INVALIDATE_CAPABILITY in workload.capabilities
+        )
+        if not privileged and (identity is None or family_id != identity.family_id):
+            raise WebSocketException(WebSocketErrorCodes.POLICY)
+        envelope = SocketDelivery(
+            version=1,
+            id=uuid4().hex,
+            instance=runtime.instance,
+            action="invalidate",
+            target=None,
+            message=None,
+            family_id=family_id,
+            issued_at=time.time(),
+            signature="0" * 64,
+        )
+        if runtime.transport is None:
+            return SocketReceipt("local", runtime.receive_delivery(envelope))
+        return SocketReceipt("redis", await runtime.transport.publish(envelope))

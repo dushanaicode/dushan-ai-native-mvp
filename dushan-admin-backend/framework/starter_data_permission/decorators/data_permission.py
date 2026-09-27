@@ -1,0 +1,44 @@
+from framework.starter_data_permission.model.data_permission_model import DataPermissionModel
+from framework.starter_database.model.model_scanner import ModelScanner
+
+
+def data_permission(
+    *,
+    permission_type,
+    user_id_column=None,
+    dept_id_column=None,
+    description="",
+    resource=None,
+):
+    """声明本人、部门或二者的记录范围；归属列支持整数及字符串 ID。
+
+    description 仅作为声明处的业务说明，不参与运行时授权或模型登记。
+    """
+    expected = {"user_scope": (True, False), "dept_scope": (False, True), "both": (True, True)}
+    if permission_type not in expected or expected[permission_type] != (
+        user_id_column is not None,
+        dept_id_column is not None,
+    ):
+        raise ValueError("数据权限类型与用户/部门归属列不一致")
+
+    def mark(model):
+        if "__data_permission__" in vars(model):
+            raise ValueError("模型不能重复声明数据权限")
+        model.__data_permission__ = DataPermissionModel(
+            model, False, user_id_column, dept_id_column, resource
+        )
+        return ModelScanner.mark(model)
+
+    return mark
+
+
+def public_data():
+    """明确声明该表不应用记录范围过滤；接口身份和权限仍由 Security 校验。"""
+
+    def mark(model):
+        if "__data_permission__" in vars(model):
+            raise ValueError("模型不能重复声明数据权限")
+        model.__data_permission__ = DataPermissionModel(model, True)
+        return ModelScanner.mark(model)
+
+    return mark

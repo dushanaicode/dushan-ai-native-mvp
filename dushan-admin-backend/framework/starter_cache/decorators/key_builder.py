@@ -1,0 +1,155 @@
+import hashlib
+import inspect
+import json
+import re
+from collections.abc import Callable
+from functools import lru_cache
+from typing import Any
+
+from framework.starter_cache.definitions.constants.cache_error_codes import CacheErrorCodes
+from framework.starter_cache.exception.cache_exception import CacheException
+
+
+class KeyBuilder:
+    """把函数参数渲染成稳定的缓存标识，模板语法是 {{参数名}}。
+
+    模板在装饰阶段就校验：只允许引用函数的直接参数，不支持属性访问和表达式，
+    这样键的取值范围在部署前就是确定的，不会因为某次调用传入意外对象而变形。
+    容器类型参数用规范化 token 求摘要，保证同一份数据在不同进程得到同一个键。
+    """
+
+    PLACEHOLDER_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def get_signature(func: Callable) -> inspect.Signature:
+        """缓存函数签名，装饰阶段与调用阶段共用同一份。"""
+        return inspect.signature(func)
+
+    @classmethod
+    def validate_template(cls, func: Callable, template: str | None) -> inspect.Signature:
+        """在装饰阶段校验模板，返回复用的签名。"""
+        signature = cls.get_signature(func)
+        if template is None:
+            return signature
+        if not isinstance(template, str) or not template:
+            raise CacheException(
+                CacheErrorCodes.INVALID_CACHE_KEY,
+                msg=f"{func.__qualname__} 的缓存键模板必须是非空字符串",
+            )
+        residual = cls.PLACEHOLDER_PATTERN.sub("", template)
+        if "{{" in residual or "}}" in residual:
+            raise CacheException(
+                CacheErrorCodes.INVALID_CACHE_KEY,
+                msg=f"{func.__qualname__} 的缓存键模板包含不支持的占位符：{template}",
+            )
+        parameters = cls._parameter_names(signature)
+        unknown = sorted(set(cls.PLACEHOLDER_PATTERN.findall(template)) - set(parameters))
+        if unknown:
+            raise CacheException(
+                CacheErrorCodes.INVALID_CACHE_KEY,
+                msg=(
+                    f"{func.__qualname__} 的缓存键模板引用了未知参数 {unknown}；"
+                    f"可用参数：{parameters}"
+                ),
+            )
+        return signature
+
+    @classmethod
+    def build_identifier(
+        cls,
+        template: str | None,
+        func: Callable,
+        signature: inspect.Signature,
+        args: tuple,
+        kwargs: dict,
+    ) -> str:
+        """渲染本次调用的缓存标识；没有模板时按函数名和全部参数生成。
+
+        占位符一次性替换：参数值里出现的 {{name}} 不会被当成占位符再替换一遍。
+        标识本身是直接拼接，模板里的分隔符对参数值不转义，因此多占位符模板
+        必须保证各段取值不会互相串位（"a:{{x}}:b:{{y}}" 中 x 含 ":b:" 会与另一组取值撞键）。
+        """
+        arguments = cls.bind_arguments(signature, args, kwargs)
+        if template is None:
+            parts = [func.__name__]
+            parts.extend(
+                f"{name}={cls.serialize_value(value)}" for name, value in arguments.items()
+            )
+            return ":".join(parts)
+        return cls.PLACEHOLDER_PATTERN.sub(
+            lambda match: cls.serialize_value(arguments[match.group(1)]), template
+        )
+
+    @classmethod
+    def bind_arguments(
+        cls, signature: inspect.Signature, args: tuple, kwargs: dict
+    ) -> dict[str, Any]:
+        """按签名统一位置参数、关键字参数和默认值，并去掉 self/cls。"""
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        names = list(signature.parameters)
+        if names and names[0] in ("self", "cls"):
+            arguments.pop(names[0], None)
+        return arguments
+
+    @staticmethod
+    def _parameter_names(signature: inspect.Signature) -> list[str]:
+        """返回模板可引用的参数名，不含 self/cls。"""
+        names = list(signature.parameters)
+        if names and names[0] in ("self", "cls"):
+            return names[1:]
+        return names
+
+    @classmethod
+    def serialize_value(cls, value: Any) -> str:
+        """把参数转成键片段；容器类型取规范化摘要，避免键过长或顺序不稳定。"""
+        if value is None:
+            return "none"
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, (list, tuple, set, frozenset, dict)):
+            digest = hashlib.sha256(cls._canonical_token(value).encode("utf-8")).hexdigest()[:16]
+            return f"{type(value).__name__}:{digest}"
+        raise CacheException(
+            CacheErrorCodes.INVALID_CACHE_KEY,
+            msg=f"缓存键参数不支持类型 {type(value).__name__}",
+        )
+
+    @classmethod
+    def _canonical_token(cls, value: Any) -> str:
+        """生成跨进程稳定且区分类型的 token：1 和 True、1 和 "1" 不会得到同一个键。"""
+        if value is None:
+            return "none"
+        if isinstance(value, bool):
+            return f"bool:{str(value).lower()}"
+        if isinstance(value, int):
+            return f"int:{value}"
+        if isinstance(value, float):
+            return f"float:{value.hex()}"
+        if isinstance(value, str):
+            return f"str:{json.dumps(value, ensure_ascii=True)}"
+        if isinstance(value, list):
+            return "list:[" + ",".join(cls._canonical_token(item) for item in value) + "]"
+        if isinstance(value, tuple):
+            return "tuple:[" + ",".join(cls._canonical_token(item) for item in value) + "]"
+        if isinstance(value, set):
+            return "set:[" + ",".join(sorted(cls._canonical_token(item) for item in value)) + "]"
+        if isinstance(value, frozenset):
+            members = sorted(cls._canonical_token(item) for item in value)
+            return "frozenset:[" + ",".join(members) + "]"
+        if isinstance(value, dict):
+            items = sorted(
+                (cls._canonical_token(key), cls._canonical_token(item))
+                for key, item in value.items()
+            )
+            return "dict:{" + ",".join(f"{key}={item}" for key, item in items) + "}"
+        raise CacheException(
+            CacheErrorCodes.INVALID_CACHE_KEY,
+            msg=f"缓存键容器成员不支持类型 {type(value).__name__}",
+        )

@@ -1,0 +1,248 @@
+import asyncio
+import hashlib
+import json
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from time import monotonic
+from typing import get_args
+
+from framework.starter_cache.core.cache_handler import CacheHandler
+from framework.starter_data_permission.config.data_permission_settings import DataPermissionSettings
+from framework.starter_data_permission.core.data_scope_resolver import DataScopeResolver
+from framework.starter_data_permission.definitions.constants.data_permission_error_codes import (
+    DataPermissionErrorCodes,
+)
+from framework.starter_data_permission.exception.data_permission_exception import (
+    DataPermissionException,
+)
+from framework.starter_data_permission.model.data_exemption import DataExemption
+from framework.starter_data_permission.model.data_grant import DataGrant
+from framework.starter_data_permission.model.data_permission_frame import DataPermissionFrame
+from framework.starter_data_permission.model.data_permission_snapshot import DataPermissionSnapshot
+from framework.starter_data_permission.spi.data_exemption_provider import (
+    DataExemptionProvider,
+    DataOperation,
+)
+from framework.starter_data_permission.spi.data_permission_provider import DataPermissionProvider
+from framework.starter_di.context.application_context import ApplicationContext
+from framework.starter_di.decorators.components import framework
+from framework.starter_di.decorators.conditional import conditional
+from framework.starter_di.definitions.enums.component_scope_enum import ComponentScopeEnum
+from framework.starter_security.context.security_context import SecurityContext
+from framework.starter_security.model.identity_binding import IdentityBinding
+from framework.starter_security.model.login_session import LoginSession
+from framework.starter_security.spi.data_access_provider import DataAccessProvider
+
+
+@framework(scope=ComponentScopeEnum.SINGLETON)
+@conditional(lambda config: config.get_config(DataPermissionSettings).enabled)
+class DataPermissionService(DataAccessProvider):
+    """执行内固定快照；跨执行只按权威授权版本复用 Cache。
+
+    撤销首先由 Security 实时会话解析阻止新执行；已有执行在退出或快照到期时
+    失效，显式 invalidate 还会使当前执行失效。过期不在分页中途刷新。
+    """
+
+    def __init__(
+        self,
+        settings: DataPermissionSettings,
+        security: SecurityContext,
+        provider: DataPermissionProvider,
+        cache: CacheHandler,
+    ):
+        self.settings = settings
+        self.security = security
+        self.cache = cache
+        self.resolver = DataScopeResolver(provider)
+        self.exemptions: DataExemptionProvider | None = None
+        self._frame = ContextVar(f"data_permission_{id(self)}", default=None)
+        self._exemptions = ContextVar(f"data_exemptions_{id(self)}", default=())
+        self._closed = False
+        self._active = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    async def _call(self, callback):
+        try:
+            async with asyncio.timeout(self.settings.provider_timeout_seconds):
+                return await callback()
+        except DataPermissionException:
+            raise
+        except Exception as error:
+            raise DataPermissionException(DataPermissionErrorCodes.PROVIDER, cause=error) from error
+
+    def _identifier(self, identity):
+        parts = [
+            IdentityBinding.build(identity),
+            identity.dept_id,
+            identity.authorization_revision,
+            self.settings.rule_version,
+        ]
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+    async def _load(self, identity):
+        binding = self._identifier(identity)
+
+        async def load():
+            grant = await self.resolver.resolve(identity)
+            revision = await self.resolver.provider.revision(identity)
+            if not isinstance(revision, str):
+                raise DataPermissionException(DataPermissionErrorCodes.CONFIGURATION)
+            if revision != identity.authorization_revision:
+                raise DataPermissionException(DataPermissionErrorCodes.STALE)
+            return DataPermissionSnapshot(
+                binding=binding, revision=identity.authorization_revision, grant=grant
+            ).model_dump(mode="json")
+
+        if self.settings.cache_enabled:
+            value = await self._call(
+                lambda: self.cache.get_or_load(
+                    self.settings.cache_key(),
+                    binding,
+                    load,
+                    self.settings.cache_ttl_seconds,
+                    wait_seconds=self.settings.provider_timeout_seconds,
+                    critical_section_timeout_seconds=self.settings.provider_timeout_seconds,
+                    lease_seconds=self.settings.provider_timeout_seconds + 1,
+                )
+            )
+        else:
+            value = await self._call(load)
+        try:
+            snapshot = DataPermissionSnapshot.model_validate_json(json.dumps(value))
+        except (ValueError, TypeError) as error:
+            raise DataPermissionException(DataPermissionErrorCodes.PROVIDER, cause=error) from error
+        if snapshot.binding != binding or snapshot.revision != identity.authorization_revision:
+            raise DataPermissionException(DataPermissionErrorCodes.PROVIDER)
+        return snapshot.grant
+
+    @asynccontextmanager
+    async def enter(self, identity):
+        if self._closed:
+            raise DataPermissionException(DataPermissionErrorCodes.CLOSED)
+        binding = ApplicationContext.current_execution()
+        if binding.application is not self.security.application:
+            raise DataPermissionException(DataPermissionErrorCodes.CONFIGURATION)
+        current = (
+            self.security.current()
+            if isinstance(identity, LoginSession)
+            else self.security.current_workload()
+        )
+        if current is not identity:
+            raise DataPermissionException(DataPermissionErrorCodes.MISSING)
+        self._active += 1
+        self._idle.clear()
+        token = self._frame.set(None)
+        frame = None
+        try:
+            grant = (
+                await self._load(identity) if isinstance(identity, LoginSession) else DataGrant()
+            )
+            frame = DataPermissionFrame(
+                binding, identity, grant, monotonic() + self.settings.snapshot_seconds
+            )
+            self._frame.set(frame)
+            yield
+        finally:
+            if frame is not None:
+                frame.active = False
+            self._frame.reset(token)
+            self._active -= 1
+            if not self._active:
+                self._idle.set()
+
+    def current(self) -> DataPermissionFrame:
+        frame = self._frame.get()
+        if frame is None or not frame.active or not frame.binding.active:
+            raise DataPermissionException(DataPermissionErrorCodes.MISSING)
+        if (
+            frame.binding is not ApplicationContext.current_execution()
+            or frame.binding.application is not self.security.application
+        ):
+            raise DataPermissionException(DataPermissionErrorCodes.MISSING)
+        current = (
+            self.security.current()
+            if isinstance(frame.identity, LoginSession)
+            else self.security.current_workload()
+        )
+        if current is not frame.identity:
+            raise DataPermissionException(DataPermissionErrorCodes.MISSING)
+        if monotonic() >= frame.expires_at:
+            raise DataPermissionException(DataPermissionErrorCodes.STALE)
+        return frame
+
+    def require_user_access(self, user_id: str) -> None:
+        frame = self.current()
+        if not (frame.grant.all_data or user_id in frame.grant.user_ids):
+            raise DataPermissionException(DataPermissionErrorCodes.DENIED)
+
+    def require_all_data_access(self) -> None:
+        if not self.current().grant.all_data:
+            raise DataPermissionException(DataPermissionErrorCodes.DENIED)
+
+    async def invalidate(self, identity: LoginSession) -> None:
+        """权限更新后失效旧版本；其他执行仍遵循固定快照的有效期上限。"""
+        current = self.current()
+        if identity.application_id != current.identity.application_id:
+            raise DataPermissionException(DataPermissionErrorCodes.DENIED)
+        if self.settings.cache_enabled:
+            await self._call(
+                lambda: self.cache.delete(self.settings.cache_key(), self._identifier(identity))
+            )
+        frame = self._frame.get()
+        if isinstance(frame.identity, LoginSession) and self._identifier(
+            frame.identity
+        ) == self._identifier(identity):
+            frame.active = False
+
+    @asynccontextmanager
+    async def exempt(self, resource, operation, *, reason):
+        frame = self.current()
+        if (
+            not resource
+            or operation not in get_args(DataOperation)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 256
+        ):
+            raise DataPermissionException(DataPermissionErrorCodes.CONFIGURATION)
+        if self.exemptions is None:
+            raise DataPermissionException(DataPermissionErrorCodes.DENIED)
+        allowed = await self._call(
+            lambda: self.exemptions.authorize(frame.identity, resource, operation, reason)
+        )
+        if allowed is not True:
+            raise DataPermissionException(DataPermissionErrorCodes.DENIED)
+        self.current()
+        exemption = DataExemption(frame, resource, operation)
+        token = self._exemptions.set((*self._exemptions.get(), exemption))
+        try:
+            yield
+        finally:
+            exemption.active = False
+            self._exemptions.reset(token)
+
+    def is_exempt(self, resource, operation):
+        frame = self.current()
+        return any(
+            item.active
+            and item.frame is frame
+            and item.resource == resource
+            and item.operation == operation
+            for item in self._exemptions.get()
+        )
+
+    def execution_key(self):
+        if self._frame.get() is None:
+            identity = self.security.current() or self.security.current_workload()
+            if identity is None:
+                raise DataPermissionException(DataPermissionErrorCodes.MISSING)
+            return identity
+        frame = self.current()
+        return frame, tuple(
+            item for item in self._exemptions.get() if item.active and item.frame is frame
+        )
+
+    async def close(self):
+        self._closed = True
+        await self._idle.wait()

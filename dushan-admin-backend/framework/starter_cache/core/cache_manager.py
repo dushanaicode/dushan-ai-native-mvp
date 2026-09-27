@@ -1,0 +1,218 @@
+import asyncio
+from threading import RLock
+
+from loguru import logger
+from redis.asyncio import Redis
+
+from framework.common.utils.cleanup_utils import CleanupUtils
+from framework.starter_cache.config.cache_settings import CacheSettings
+from framework.starter_cache.core.cache_resource_snapshot import CacheResourceSnapshot
+from framework.starter_cache.core.redis_client_factory import RedisClientFactory
+from framework.starter_cache.definitions.constants.cache_error_codes import CacheErrorCodes
+from framework.starter_cache.definitions.enums.cache_lifecycle_phase_enum import (
+    CacheLifecyclePhaseEnum,
+)
+from framework.starter_cache.exception.cache_exception import CacheException
+from framework.starter_di.decorators.components import framework
+from framework.starter_di.decorators.inject import Inject
+
+
+@framework
+class CacheManager:
+    """按应用持有全部 Redis 客户端与连接池，并以原子快照管理它们的生命周期。
+
+    客户端只有在整代资源全部创建并探活成功后才对外可见；任何一步失败都会反向
+    关闭已创建的资源。关闭失败的引用继续由本实例保留，下次关闭时重试，
+    不会被丢弃成无法回收的连接。实例由容器按应用创建，没有类级共享状态。
+    """
+
+    _settings: CacheSettings = Inject()
+    _factory: RedisClientFactory = Inject()
+
+    def __init__(self) -> None:
+        self._lifecycle_lock = asyncio.Lock()
+        self._state_lock = RLock()
+        self._phase = CacheLifecyclePhaseEnum.STOPPED
+        self._active = CacheResourceSnapshot()
+        self._pending_close = CacheResourceSnapshot()
+
+    @property
+    def is_ready(self) -> bool:
+        """只有完整提交的资源快照才算可用。"""
+        with self._state_lock:
+            return self._phase is CacheLifecyclePhaseEnum.READY
+
+    @property
+    def phase(self) -> CacheLifecyclePhaseEnum:
+        """返回当前生命周期阶段，供启动器和诊断读取。"""
+        with self._state_lock:
+            return self._phase
+
+    async def check_health(self) -> bool:
+        """探活已启用的全部客户端，超时受现有连接、借池和命令期限共同限制。"""
+        with self._state_lock:
+            if self._phase is not CacheLifecyclePhaseEnum.READY:
+                return False
+            snapshot = self._active
+        timeout = (
+            self._settings.pool_wait_timeout_seconds
+            + self._settings.socket_connect_timeout_seconds
+            + self._settings.socket_timeout_seconds
+        )
+        async with asyncio.timeout(timeout):
+            async with asyncio.TaskGroup() as tasks:
+                for client in snapshot.clients.values():
+                    tasks.create_task(self._factory.require_ping(client))
+        with self._state_lock:
+            return self._phase is CacheLifecyclePhaseEnum.READY and self._active is snapshot
+
+    async def open(self) -> None:
+        """创建并探活配置声明的全部客户端，成功后一次提交资源快照。"""
+        async with self._lifecycle_lock:
+            with self._state_lock:
+                if self._phase is CacheLifecyclePhaseEnum.READY:
+                    return
+                if self._phase is CacheLifecyclePhaseEnum.CLOSE_FAILED:
+                    raise CacheException(
+                        CacheErrorCodes.INIT_FAILED,
+                        msg="缓存资源上次关闭失败，必须先重试关闭",
+                    )
+                self._phase = CacheLifecyclePhaseEnum.INITIALIZING
+            if not self._settings.clients:
+                with self._state_lock:
+                    self._phase = CacheLifecyclePhaseEnum.STOPPED
+                raise CacheException(CacheErrorCodes.CONFIG_ERROR, msg="缓存客户端配置不能为空")
+
+            staging = CacheResourceSnapshot()
+            try:
+                await self._create_clients(staging)
+            except BaseException as error:
+                await self._rollback(staging, error)
+            with self._state_lock:
+                self._active = staging
+                self._phase = CacheLifecyclePhaseEnum.READY
+            logger.info("【CacheStarter】Redis 连接池探活通过：{} 个客户端", len(staging.clients))
+
+    async def _create_clients(self, staging: CacheResourceSnapshot) -> None:
+        """按声明顺序创建资源，先登记所有权再探活，取消也不会丢失引用。"""
+        for client_settings in self._settings.clients:
+            pool = self._factory.create_pool(self._settings, client_settings)
+            staging.pools[client_settings.name] = pool
+            client = self._factory.create_client(pool)
+            staging.clients[client_settings.name] = client
+            await self._factory.require_ping(client)
+            logger.debug(
+                "【CacheStarter】客户端={} host={} port={} db={} max_connections={}",
+                client_settings.name,
+                self._settings.host,
+                self._settings.port,
+                client_settings.db,
+                self._settings.max_connections,
+            )
+
+    async def _rollback(self, staging: CacheResourceSnapshot, error: BaseException) -> None:
+        """启动失败时反向清理未提交资源，并保留清理失败的引用。
+
+        本方法一定抛出：初始化失败或取消作为终态异常，清理失败经异常链保留。
+        取消不能装进 BaseExceptionGroup，否则调用方的 asyncio.timeout 无法转成
+        TimeoutError，任务也不再被视为已取消。
+        """
+        failed, cleanup_errors, cancellation = await self._close_snapshot(staging)
+        with self._state_lock:
+            self._pending_close = failed
+            self._phase = (
+                CacheLifecyclePhaseEnum.CLOSE_FAILED
+                if cleanup_errors or cancellation is not None
+                else CacheLifecyclePhaseEnum.STOPPED
+            )
+        if isinstance(error, Exception) and not isinstance(error, CacheException):
+            error = CacheException(CacheErrorCodes.INIT_FAILED, msg="缓存初始化失败", cause=error)
+        CleanupUtils.raise_collected_cleanup_errors(
+            "缓存初始化失败且资源清理失败",
+            cleanup_errors,
+            caller_cancellation=cancellation,
+            primary_error=error,
+        )
+
+    def get_client(self, client_name: str) -> Redis:
+        """从当前 READY 快照读取客户端；未就绪或名称未声明都明确失败。"""
+        with self._state_lock:
+            if self._phase is not CacheLifecyclePhaseEnum.READY:
+                raise CacheException(
+                    CacheErrorCodes.NOT_INITIALIZED,
+                    msg=f"缓存当前不可用：{self._phase.code}",
+                )
+            client = self._active.clients.get(client_name)
+        if client is None:
+            raise CacheException(
+                CacheErrorCodes.CLIENT_NOT_FOUND,
+                msg=f"未找到缓存客户端：{client_name}",
+            )
+        return client
+
+    def get_default_client(self) -> Redis:
+        """读取配置声明的默认客户端，供分布式锁等没有业务前缀的场景使用。"""
+        return self.get_client(self._settings.default_client)
+
+    async def close(self) -> None:
+        """先撤销可见性，再关闭整代资源；关闭失败的引用留到下次重试。"""
+        async with self._lifecycle_lock:
+            with self._state_lock:
+                if self._phase is CacheLifecyclePhaseEnum.STOPPED and self._pending_close.is_empty:
+                    return
+                self._phase = CacheLifecyclePhaseEnum.CLOSING
+                resources = self._pending_close.merge(self._active)
+                self._active = CacheResourceSnapshot()
+                self._pending_close = CacheResourceSnapshot()
+
+            failed, errors, cancellation = await self._close_snapshot(resources)
+            with self._state_lock:
+                self._pending_close = failed
+                self._phase = (
+                    CacheLifecyclePhaseEnum.CLOSE_FAILED
+                    if errors or cancellation is not None
+                    else CacheLifecyclePhaseEnum.STOPPED
+                )
+            if cancellation is not None:
+                CleanupUtils.raise_collected_cleanup_errors(
+                    "缓存资源关闭失败", errors, caller_cancellation=cancellation
+                )
+            if errors:
+                if len(errors) == 1:
+                    raise errors[0]
+                raise BaseExceptionGroup("缓存资源关闭失败", errors)
+            logger.info("【CacheStarter】缓存连接已全部关闭")
+
+    @staticmethod
+    async def _close_snapshot(
+        resources: CacheResourceSnapshot,
+    ) -> tuple[CacheResourceSnapshot, list[BaseException], asyncio.CancelledError | None]:
+        """逐个关闭客户端和连接池，返回仍需重试的引用、失败原因与遇到的取消。
+
+        取消与其他关闭失败分开返回：关闭要继续做完才不会漏掉后面的资源，
+        但取消必须由调用方作为终态异常重新抛出，混进错误列表会被异常组吞掉。
+        """
+        failed = CacheResourceSnapshot()
+        errors: list[BaseException] = []
+        cancellation: asyncio.CancelledError | None = None
+        for name, client in reversed(tuple(resources.clients.items())):
+            try:
+                await client.aclose()
+            except asyncio.CancelledError as error:
+                failed.clients[name] = client
+                if cancellation is None:
+                    cancellation = error
+            except BaseException as error:
+                failed.clients[name] = client
+                errors.append(error)
+        for name, pool in reversed(tuple(resources.pools.items())):
+            try:
+                await pool.disconnect(inuse_connections=True)
+            except asyncio.CancelledError as error:
+                failed.pools[name] = pool
+                if cancellation is None:
+                    cancellation = error
+            except BaseException as error:
+                failed.pools[name] = pool
+                errors.append(error)
+        return failed, errors, cancellation

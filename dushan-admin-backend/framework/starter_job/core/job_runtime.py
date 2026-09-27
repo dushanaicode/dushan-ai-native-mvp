@@ -1,0 +1,597 @@
+import asyncio
+import hashlib
+from collections import Counter
+from contextvars import Context
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+from apscheduler.events import EVENT_SCHEDULER_SHUTDOWN
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.base import STATE_RUNNING
+from loguru import logger
+
+from framework.common.utils.asyncio_utils import AsyncioUtils
+from framework.starter_cache.exception.redis_recovery import RedisRecovery
+from framework.starter_cache.lock.redis_lease_lock import RedisLeaseLock
+from framework.starter_di.context.application_state_enum import ApplicationStateEnum
+from framework.starter_job.core.job_invoker import JobInvoker
+from framework.starter_job.cron.standard_cron_trigger import StandardCronTrigger
+from framework.starter_job.definitions.constants.job_error_codes import JobErrorCodes
+from framework.starter_job.definitions.enums.job_state import JobState
+from framework.starter_job.definitions.enums.job_trigger_kind import JobTriggerKind
+from framework.starter_job.exception.job_exception import JobException
+from framework.starter_job.model.job_definition import JobDefinition
+from framework.starter_job.model.job_outcome import JobOutcome
+from framework.starter_job.model.job_request import JobRequest
+from framework.starter_monitor.spi.monitor_provider import MonitorProvider
+from framework.starter_security.spi.security_execution_provider import SecurityExecutionProvider
+
+
+class JobRuntime:
+    """内存调度副本、单 owner 信箱和有界执行；业务定义始终由 SPI 提供。"""
+
+    def __init__(
+        self,
+        settings,
+        application,
+        registry,
+        definitions,
+        requests,
+        records,
+        security: SecurityExecutionProvider,
+        cache,
+        monitor: MonitorProvider,
+    ):
+        self.settings, self.application, self.registry = settings, application, registry
+        self.definitions, self.requests, self.cache = definitions, requests, cache
+        self.invoker = JobInvoker(application, security, registry, records, settings, monitor)
+        self.scheduler = AsyncIOScheduler(
+            jobstores={"default": MemoryJobStore()},
+            timezone=registry.timezone,
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": None},
+        )
+        self.plans = {}
+        self.running = {}
+        self.counts = Counter()
+        self.lease = None
+        self.owner = False
+        self.accepting = False
+        self.phase = "new"
+        self.failure = None
+        self.observation_failures = 0
+        self.recovery_attempts = 0
+        self._stop = asyncio.Event()
+        self._renew_stop = asyncio.Event()
+        self._loop_task = None
+        self._renew_task = None
+        self._closing = None
+        self._sync_lock = asyncio.Lock()
+
+    @property
+    def is_ready(self) -> bool:
+        """待命进程检查主循环，owner 还必须持有有效租约并实际运行调度器。"""
+        if (
+            not self.accepting
+            or self.application.state is not ApplicationStateEnum.READY
+            or self.phase not in {"client", "running"}
+            or self.failure is not None
+            or self._closing is not None
+            or self._loop_task is None
+            or self._loop_task.done()
+        ):
+            return False
+        if not self.owner:
+            return self.phase == "client"
+        return (
+            self.phase == "running"
+            and self.lease is not None
+            and self.lease.is_valid
+            and self._renew_task is not None
+            and not self._renew_task.done()
+            and self.scheduler.state == STATE_RUNNING
+        )
+
+    async def _call(self, callback):
+        async with asyncio.timeout(self.settings.command_timeout_seconds):
+            return await callback()
+
+    async def open(self):
+        if any(
+            value is None
+            for value in (
+                self.definitions,
+                self.requests,
+                self.invoker.records,
+                self.invoker.security,
+            )
+        ):
+            raise JobException(JobErrorCodes.CONFIGURATION)
+        self.phase = "starting"
+        logger.info("【JobStarter】开始初始化任务运行时")
+        if self.settings.owner_enabled:
+            self.lease = self._new_lease()
+            self.owner = await self.lease.acquire()
+            logger.info(
+                "【JobStarter】调度所有权申请结果：{}",
+                "已取得 owner 租约" if self.owner else "未取得租约，以 client 模式运行",
+            )
+            if self.owner:
+                self.scheduler.start(paused=True)
+                logger.info("【JobStarter】调度器已创建并暂停，开始同步任务定义")
+                self._renew_task = asyncio.create_task(
+                    self._renew(), context=Context(), name="job-owner-renew"
+                )
+                await self.reconcile()
+                logger.info("【JobStarter】任务定义同步完成：启用 {} 个", len(self.plans))
+                for definition in self.plans.values():
+                    logger.debug(
+                        "【JobStarter】任务 id={} handler={} cron={}",
+                        definition.id,
+                        definition.handler_key,
+                        definition.cron,
+                    )
+        else:
+            logger.info("【JobStarter】owner 未启用，以 client 模式运行，不加载调度计划")
+        self.phase = "waiting" if self.owner else "client"
+        self.accepting = True
+        logger.info(
+            "【JobStarter】资源初始化完成：模式={}，等待宿主激活",
+            "owner" if self.owner else "client",
+        )
+
+    async def activate(self):
+        """由宿主在依赖激活后直接等待；调度器恢复完成才返回。"""
+        if (
+            self.application.state is not ApplicationStateEnum.READY
+            or self.phase not in {"waiting", "client"}
+            or self._loop_task is not None
+        ):
+            raise JobException(JobErrorCodes.CLOSED)
+        if self.owner:
+            self._require_owner()
+            self.scheduler.resume()
+            self.phase = "running"
+        self._loop_task = asyncio.create_task(
+            self._loop(), context=Context(), name="job-owner-loop"
+        )
+        logger.info(
+            "【JobStarter】激活完成：{}", "任务调度开始运行" if self.owner else "client 模式已就绪"
+        )
+
+    def _require_owner(self):
+        if not self.owner or self.lease is None or not self.lease.is_valid:
+            raise JobException(JobErrorCodes.OWNER)
+
+    def _new_lease(self):
+        key = self.settings.owner_key()
+        return RedisLeaseLock(
+            self.cache.get_client(key),
+            self.cache.build_full_key(key, self.settings.namespace),
+            self.settings.owner_lease_seconds,
+            0,
+            command_timeout_seconds=self.settings.command_timeout_seconds,
+        )
+
+    async def _recover_owner(self):
+        # 正常待命实例尝试竞选不代表故障；取得所有权后才进入调度器恢复阶段。
+        if self.phase != "client":
+            self.phase = "recovering"
+        if self._renew_task is not None:
+            self._renew_task.cancel()
+            await asyncio.gather(self._renew_task, return_exceptions=True)
+            self._renew_task = None
+        if self.lease is not None and self.lease.release_required:
+            await self.lease.release()
+        self.lease = self._new_lease()
+        self.owner = await self.lease.acquire()
+        if not self.owner:
+            self.phase = "client"
+            self.failure = None
+            return
+        self.phase = "recovering"
+        if self._stop.is_set() or self.application.state is not ApplicationStateEnum.READY:
+            await self.lease.release()
+            self.owner = False
+            return
+        if not self.scheduler.running:
+            self.scheduler.start(paused=True)
+        self._renew_task = asyncio.create_task(
+            self._renew(), context=Context(), name="job-owner-renew"
+        )
+        await self.reconcile()
+        if self._stop.is_set():
+            return
+        self._require_owner()
+        self.scheduler.resume()
+        self.phase = "running"
+        self.failure = None
+        logger.info("Job 已自动恢复调度所有权")
+
+    def _lose_owner(self, error=None):
+        self.owner = False
+        self.phase = "owner_lost"
+        self.failure = error
+        if self._renew_task is not None and self._renew_task is not asyncio.current_task():
+            self._renew_task.cancel()
+        if self.scheduler.running:
+            self.scheduler.pause()
+
+    async def _renew(self):
+        while not self._renew_stop.is_set():
+            try:
+                await asyncio.wait_for(self._renew_stop.wait(), self.settings.owner_renew_seconds)
+                return
+            except TimeoutError:
+                pass
+            try:
+                if not await self.lease.renew():
+                    self._lose_owner()
+                    return
+            except Exception as error:
+                self._lose_owner(error)
+                logger.error("Job owner 续租失败，停止新触发：{}", type(error).__name__)
+                return
+
+    async def reconcile(self):
+        self._require_owner()
+        async with self._sync_lock:
+            try:
+                definitions = await self._call(self.definitions.list_definitions)
+                if (
+                    not isinstance(definitions, tuple)
+                    or len(definitions) > self.settings.max_jobs
+                    or any(not isinstance(item, JobDefinition) for item in definitions)
+                ):
+                    raise JobException(JobErrorCodes.CONFIGURATION)
+            except Exception:
+                self.scheduler.remove_all_jobs()
+                self.plans.clear()
+                raise
+            incoming = {}
+            seen = set()
+            errors = []
+            for definition in definitions:
+                if self._stop.is_set():
+                    return
+                if definition.id in seen:
+                    self.scheduler.remove_all_jobs()
+                    self.plans.clear()
+                    raise JobException(JobErrorCodes.CONFIGURATION)
+                seen.add(definition.id)
+                if not definition.enabled:
+                    continue
+                try:
+                    schedule = self.registry.validate(definition)
+                    incoming[definition.id] = definition.model_copy(deep=True)
+                    if self.plans.get(definition.id) != definition:
+                        self.scheduler.add_job(
+                            self._scheduled,
+                            trigger=StandardCronTrigger(schedule),
+                            args=(definition.id,),
+                            id=definition.id,
+                            replace_existing=True,
+                        )
+                    await self._submit_latest(definition, schedule)
+                except Exception as error:
+                    incoming.pop(definition.id, None)
+                    if self.scheduler.get_job(definition.id) is not None:
+                        self.scheduler.remove_job(definition.id)
+                    errors.append(error)
+            for job in self.scheduler.get_jobs():
+                if job.id not in incoming:
+                    self.scheduler.remove_job(job.id)
+            self.plans = incoming
+            if errors:
+                raise ExceptionGroup("任务同步失败；相关计划已移除", errors)
+
+    async def _submit_latest(self, definition, schedule):
+        now = datetime.now(UTC)
+        due = schedule.previous(now)
+        checkpoint = await self._call(lambda: self.requests.checkpoint(definition.id))
+        if due < definition.effective_at or checkpoint is not None and due <= checkpoint:
+            return
+        identity = hashlib.sha256(
+            f"{definition.id}:{definition.revision}:{due.isoformat()}".encode()
+        ).hexdigest()
+        request = JobRequest(
+            request_id=identity,
+            definition=definition.model_copy(deep=True),
+            trigger=JobTriggerKind.SCHEDULED,
+            scheduled_at=due,
+            ready_at=now,
+            attempt=1,
+        )
+        await self._call(
+            lambda: self.requests.submit(request, pending_limit=self.settings.pending_limit)
+        )
+
+    async def _scheduled(self, job_id):
+        if not self.owner or self.application.state is not ApplicationStateEnum.READY:
+            return
+        self._require_owner()
+        with self.application.execution():
+            definition = self.plans.get(job_id)
+            if definition is not None:
+                await self._submit_latest(definition, self.registry.validate(definition))
+
+    async def submit_manual(self, job_id):
+        if not self.accepting:
+            raise JobException(JobErrorCodes.CLOSED)
+        definition = await self._call(lambda: self.definitions.get_definition(job_id))
+        if definition is None or not definition.enabled:
+            raise JobException(JobErrorCodes.DISABLED)
+        self.registry.validate(definition)
+        now = datetime.now(UTC)
+        request = JobRequest(
+            request_id=uuid4().hex,
+            definition=definition.model_copy(deep=True),
+            trigger=JobTriggerKind.MANUAL,
+            scheduled_at=now,
+            ready_at=now,
+            attempt=1,
+        )
+        await self._call(
+            lambda: self.requests.submit(request, pending_limit=self.settings.pending_limit)
+        )
+        return request.request_id
+
+    async def _loop(self):
+        next_sync = asyncio.get_running_loop().time() + self.settings.reconciliation_seconds
+        delay = self.settings.reconnect_initial_seconds
+        while not self._stop.is_set() and self.application.state is ApplicationStateEnum.READY:
+            if self.owner and not self.lease.is_valid:
+                self._lose_owner()
+            if not self.owner and self.settings.owner_enabled:
+                if (
+                    self.failure is not None
+                    and not RedisRecovery.retryable(self.failure)
+                    and not (
+                        isinstance(self.failure, JobException)
+                        and self.failure.error_code is JobErrorCodes.OWNER
+                    )
+                ):
+                    self.phase = "failed"
+                    break
+                try:
+                    with self.application.execution():
+                        await self._recover_owner()
+                    if self.owner:
+                        delay = self.settings.reconnect_initial_seconds
+                        next_sync = (
+                            asyncio.get_running_loop().time() + self.settings.reconciliation_seconds
+                        )
+                except Exception as error:
+                    self._lose_owner(error)
+                    if not RedisRecovery.retryable(error) and not (
+                        isinstance(error, JobException) and error.error_code is JobErrorCodes.OWNER
+                    ):
+                        self.phase = "failed"
+                        break
+                    self.phase = "recovering"
+                    self.recovery_attempts += 1
+                    if (
+                        self.recovery_attempts == 1
+                        or self.recovery_attempts % self.settings.reconnect_alert_after == 0
+                    ):
+                        logger.log(
+                            "ERROR"
+                            if self.recovery_attempts >= self.settings.reconnect_alert_after
+                            else "WARNING",
+                            "Job 正在自动恢复 attempt={} delay={} error_type={}",
+                            self.recovery_attempts,
+                            delay,
+                            type(error).__name__,
+                        )
+                if not self.owner:
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), delay)
+                    except TimeoutError:
+                        pass
+                    delay = min(self.settings.reconnect_max_seconds, delay * 2)
+                    continue
+            if self.owner:
+                try:
+                    with self.application.execution():
+                        if (
+                            await self._call(self.requests.consume_changes)
+                            or asyncio.get_running_loop().time() >= next_sync
+                        ):
+                            try:
+                                await self.reconcile()
+                                self.failure = None
+                            except Exception as error:
+                                if RedisRecovery.retryable(error):
+                                    raise
+                                self.failure = error
+                                logger.error(
+                                    "Job 周期同步失败，已按任务 fail-closed：{}",
+                                    type(error).__name__,
+                                )
+                            next_sync = (
+                                asyncio.get_running_loop().time()
+                                + self.settings.reconciliation_seconds
+                            )
+                        await self._dispatch()
+                except Exception as error:
+                    self.failure = error
+                    self._lose_owner(error)
+                    logger.error("Job owner 控制循环失败，停止新执行：{}", type(error).__name__)
+                    if not RedisRecovery.retryable(error) and not (
+                        isinstance(error, JobException) and error.error_code is JobErrorCodes.OWNER
+                    ):
+                        break
+            try:
+                await asyncio.wait_for(self._stop.wait(), self.settings.poll_seconds)
+            except TimeoutError:
+                pass
+
+    async def _dispatch(self):
+        while not self._stop.is_set() and len(self.running) < self.settings.concurrency:
+            self._require_owner()
+            lease = self.lease
+            excluded = frozenset(
+                job_id
+                for job_id, count in self.counts.items()
+                if job_id not in self.plans or count >= self.plans[job_id].max_instances
+            )
+            request = await self._call(
+                lambda: self.requests.claim(
+                    lease.owner_token, exclude_jobs=excluded, now=datetime.now(UTC)
+                )
+            )
+            if request is None:
+                return
+            if (
+                not self.owner
+                or self._stop.is_set()
+                or not lease.is_valid
+                or self.application.state is not ApplicationStateEnum.READY
+            ):
+                await self._call(lambda: self.requests.retry(request, lease.owner_token))
+                self._lose_owner()
+                return
+            job_id = request.definition.id
+            if self.counts[job_id] >= request.definition.max_instances:
+                await self._call(lambda: self.requests.retry(request, lease.owner_token))
+                return
+            self.counts[job_id] += 1
+            task = self.application.tasks.create_task(
+                self._execute_request, request, lease, name="job-" + request.request_id
+            )
+            self.running[request.request_id] = (job_id, task)
+            task.add_done_callback(
+                lambda completed, identifier=request.request_id, claim_lease=lease: self._completed(
+                    identifier, completed, claim_lease
+                )
+            )
+
+    def _completed(self, request_id, task, lease):
+        job_id, _ = self.running.pop(request_id)
+        self.counts[job_id] -= 1
+        if not self.counts[job_id]:
+            del self.counts[job_id]
+        if self.lease is lease and not task.cancelled() and task.exception() is not None:
+            self._lose_owner(task.exception())
+
+    async def _execute_request(self, request, lease):
+        if not self.owner or self.lease is not lease or not lease.is_valid:
+            await self._call(lambda: self.requests.retry(request, lease.owner_token))
+            return
+        current = await self._call(lambda: self.definitions.get_definition(request.definition.id))
+        started = datetime.now(UTC)
+        if current is None or not current.enabled or current != request.definition:
+            outcome = JobOutcome(JobState.SKIPPED, error=JobException(JobErrorCodes.SNAPSHOT))
+            await self._record_only(request, outcome, started)
+        elif (
+            request.trigger is JobTriggerKind.SCHEDULED
+            and request.attempt == 1
+            and started - request.scheduled_at
+            > timedelta(seconds=self.settings.misfire_grace_seconds)
+        ):
+            outcome = JobOutcome(JobState.SKIPPED, result="misfire_grace_exceeded")
+            await self._record_only(request, outcome, started)
+        else:
+            self.registry.validate(current)
+            outcome = await self.invoker.invoke(request)
+        self.observation_failures += len(outcome.observation_errors)
+        if (
+            outcome.state is JobState.FAILED
+            and request.attempt <= request.definition.max_retries
+            and self.owner
+            and self.lease is lease
+            and lease.is_valid
+            and self.accepting
+        ):
+            delay = min(
+                self.settings.max_retry_seconds,
+                request.definition.retry_seconds
+                * request.definition.retry_backoff ** (request.attempt - 1),
+            )
+            retry = request.model_copy(
+                update={
+                    "attempt": request.attempt + 1,
+                    "ready_at": datetime.now(UTC) + timedelta(seconds=delay),
+                }
+            )
+            await self._call(lambda: self.requests.retry(retry, lease.owner_token))
+            return
+        await self._call(
+            lambda: self.requests.finish(request.request_id, lease.owner_token, outcome.state)
+        )
+        if (
+            outcome.state in {JobState.FAILED, JobState.TIMED_OUT, JobState.UNKNOWN}
+            and request.definition.stop_after_failure
+        ):
+            await self._call(
+                lambda: self.definitions.stop_definition(
+                    request.definition.id, request.definition.revision
+                )
+            )
+            if self.scheduler.get_job(request.definition.id) is not None:
+                self.scheduler.remove_job(request.definition.id)
+
+    async def _record_only(self, request, outcome, started):
+        try:
+            await AsyncioUtils.run_cancellation_shielded(
+                self.invoker.record(request, outcome, started)
+            )
+        except Exception as error:
+            self.observation_failures += 1
+            logger.error("Job 观测失败，业务终态保持：{}", type(error).__name__)
+
+    async def close(self):
+        if self._closing is None:
+            self._closing = asyncio.create_task(self._close(), name="job-close")
+        await asyncio.shield(self._closing)
+
+    async def _close(self):
+        self.accepting = False
+        self.phase = "closing"
+        if self.scheduler.running:
+            self.scheduler.pause()
+        self._stop.set()
+        tasks = [task for task in (self._loop_task,) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        running = [task for _, task in self.running.values()]
+        if running:
+            _, pending = await asyncio.wait(running, timeout=self.settings.shutdown_seconds)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+        self._renew_stop.set()
+        if self._renew_task is not None:
+            await asyncio.gather(self._renew_task, return_exceptions=True)
+        try:
+            if self.lease is not None and self.lease.release_required:
+                try:
+                    await self.lease.release()
+                except Exception as error:
+                    if not RedisRecovery.retryable(error):
+                        raise
+                    logger.warning(
+                        "Job 已停止，无法释放的远端租约将按 TTL 到期 error_type={}",
+                        type(error).__name__,
+                    )
+        finally:
+            if self.scheduler.running:
+                closed = asyncio.Event()
+                self.scheduler.add_listener(lambda event: closed.set(), EVENT_SCHEDULER_SHUTDOWN)
+                self.scheduler.shutdown(wait=False)
+                await closed.wait()
+            self.owner = False
+            self.phase = "closed"
+
+    def status(self):
+        return {
+            "phase": self.phase,
+            "owner": self.owner and self.lease is not None and self.lease.is_valid,
+            "plans": len(self.plans),
+            "running": len(self.running),
+            "running_threads": self.invoker.running_threads,
+            "timed_out_threads": self.invoker.timed_out_threads,
+            "observation_failures": self.observation_failures,
+            "recovery_attempts": self.recovery_attempts,
+            "failure": None if self.failure is None else type(self.failure).__name__,
+        }

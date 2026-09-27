@@ -1,0 +1,71 @@
+from sqlalchemy import false, inspect, select
+
+from framework.common.utils.cleanup_utils import CleanupUtils
+from framework.starter_database.exception.database_error_translator import DatabaseErrorTranslator
+from framework.starter_database.query.authentication_condition_builder import (
+    AuthenticationConditionBuilder,
+)
+from framework.starter_database.query.authentication_model_registry import (
+    AuthenticationModelRegistry,
+)
+
+
+class AuthenticationReader:
+    """给认证仓储绑定有限模型，只返回主库查询值。
+
+    不交付 Session/Connection，不修改普通查询策略，也不建立可向后泄漏的豁免帧。
+    业务在构造时显式列出认证所需模型；客户端不能控制模型白名单。
+    """
+
+    def __init__(self, database, models):
+        self.database = database
+        self.builder = AuthenticationConditionBuilder(AuthenticationModelRegistry(models))
+
+    async def read(self, statement):
+        """校验并过滤所有主表、别名与子查询；结果已缓冲，连接在返回前关闭。"""
+        statement = self.builder.select(statement, orm=False)
+        return await self._read_primary(self.database, statement)
+
+    @classmethod
+    async def token_exists(cls, database, token_model, *, token_digest, application_id, domain):
+        """按完整令牌定位键验证存在性；模型由服务端声明，不开放任意查询。"""
+        registry = AuthenticationModelRegistry((token_model,))
+        table = registry.require_mapper(inspect(token_model)).table
+        rows = await cls._read_primary(
+            database,
+            select(table.c.id)
+            .where(
+                table.c.token_digest == token_digest,
+                table.c.application_id == application_id,
+                table.c.domain == domain,
+                table.c.deleted == false(),
+            )
+            .limit(2),
+        )
+        if len(rows) > 1:
+            raise ValueError("令牌定位键不唯一")
+        return bool(rows)
+
+    @staticmethod
+    async def _read_primary(database, statement):
+        transactions = database._transactions
+        with transactions._operation_scope(), DatabaseErrorTranslator.boundary():
+            entry = transactions.registry.acquire()
+            connection = None
+            try:
+                connection = await entry.engine.connect()
+                result = await connection.execute(statement)
+                return result.mappings().all()
+            finally:
+                try:
+                    if connection is not None:
+                        error, cancellation = await CleanupUtils.run_cancellation_safe_cleanup(
+                            connection.close, "认证主库连接关闭"
+                        )
+                        CleanupUtils.raise_collected_cleanup_errors(
+                            "认证连接关闭失败",
+                            [] if error is None else [error],
+                            caller_cancellation=cancellation,
+                        )
+                finally:
+                    entry.release()

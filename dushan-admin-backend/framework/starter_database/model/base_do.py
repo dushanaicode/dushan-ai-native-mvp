@@ -1,0 +1,36 @@
+from datetime import datetime
+
+from sqlalchemy import BigInteger, Boolean, DateTime, Identity, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from framework.starter_database.id.snowflake_utils import SnowflakeUtils
+from framework.starter_database.model.base import Base
+
+
+class BaseDO(Base):
+    """带审计和软删除的单主键实体；时间字段统一保存 UTC naive 值。
+
+    数据库生成 ID 或显式 Snowflake 策略由应用决定；插入/更新由自有 Session
+    填充审计值。其他独立 SQLAlchemy Session 不自动获得这些应用策略。
+    """
+
+    __abstract__ = True
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), Identity(), primary_key=True
+    )
+    creator: Mapped[str] = mapped_column(String(64), default="")
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    updater: Mapped[str] = mapped_column(String(64), default="")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    @staticmethod
+    def get_create_time_from_id(identifier: int) -> datetime:
+        """返回Snowflake ID对应的UTC aware时间，与本实体存储的UTC naive字段区分。"""
+        return SnowflakeUtils.parse_id(identifier)["datetime"]

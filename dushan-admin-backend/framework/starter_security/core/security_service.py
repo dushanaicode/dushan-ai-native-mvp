@@ -1,0 +1,705 @@
+import asyncio
+import hashlib
+import hmac
+import json
+from contextlib import asynccontextmanager
+from contextvars import Context
+from datetime import datetime, timezone
+
+from loguru import logger
+
+from framework.common.exception.exceptions.base_business_exception import BaseBusinessException
+from framework.common.utils.asyncio_utils import AsyncioUtils
+from framework.common.utils.cleanup_utils import CleanupUtils
+from framework.starter_cache.core.cache_handler import CacheHandler
+from framework.starter_di.context.application_context import ApplicationContext
+from framework.starter_di.decorators.components import framework
+from framework.starter_di.decorators.conditional import conditional
+from framework.starter_di.definitions.enums.component_scope_enum import ComponentScopeEnum
+from framework.starter_security.config.security_settings import SecuritySettings
+from framework.starter_security.context.security_context import SecurityContext
+from framework.starter_security.core.opaque_token import OpaqueToken
+from framework.starter_security.core.permission_policy import PermissionPolicy
+from framework.starter_security.definitions.constants.security_error_codes import SecurityErrorCodes
+from framework.starter_security.definitions.enums.security_realm import SecurityRealm
+from framework.starter_security.exception.security_exception import SecurityException
+from framework.starter_security.model.identity_binding import IdentityBinding
+from framework.starter_security.model.login_session import LoginSession
+from framework.starter_security.model.permission_snapshot import PermissionSnapshot
+from framework.starter_security.model.request_audit import RequestAudit
+from framework.starter_security.model.workload_identity import WorkloadIdentity
+from framework.starter_security.model.workload_message import WorkloadMessage
+from framework.starter_security.spi.data_access_provider import DataAccessProvider
+from framework.starter_security.spi.message_security_provider import MessageSecurityProvider
+from framework.starter_security.spi.permission_provider import PermissionProvider
+from framework.starter_security.spi.token_provider import TokenProvider
+from framework.starter_security.spi.workload_provider import WorkloadProvider
+from framework.starter_web.routing.route_policy import RoutePolicy
+
+
+@framework(scope=ComponentScopeEnum.SINGLETON)
+@conditional(lambda config: config.get_config(SecuritySettings).enabled)
+class SecurityService:
+    """本站会话验证与访问控制，不签发第三方令牌，不拥有 Cache/数据库资源。
+
+    HTTP 使用 authorized；独立任务和消息用 run/run_message 创建新的 DI 边界。
+    TokenProvider 的实时状态查询不可缓存，权限快照只按其权威版本复用。
+    相邻模块通过 open 的显式 SPI 接入；缺失任务/消息适配明确拒绝。
+    """
+
+    def __init__(
+        self,
+        settings: SecuritySettings,
+        tokens: TokenProvider,
+        permissions: PermissionProvider,
+        cache: CacheHandler,
+        context: SecurityContext,
+    ):
+        self.settings = settings.model_copy(deep=True)
+        self.tokens = tokens
+        self.permissions = permissions
+        self.cache = cache
+        self.context = context
+        self._messages: MessageSecurityProvider | None = None
+        self._workloads: WorkloadProvider | None = None
+        self._data_access: DataAccessProvider | None = None
+        self._phase = "new"
+        self._active = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._close_task: asyncio.Task | None = None
+
+    async def open(
+        self,
+        *,
+        messages: MessageSecurityProvider | None = None,
+        workloads: WorkloadProvider | None = None,
+        data_access: DataAccessProvider | None = None,
+    ):
+        if self._phase != "new" or not self.settings.enabled:
+            raise SecurityException(SecurityErrorCodes.CLOSED)
+        self._phase = "starting"
+        logger.info("【SecurityStarter】开始初始化本站认证与授权")
+        self._messages = messages
+        self._workloads = workloads
+        self._data_access = data_access
+        logger.info(
+            "【SecurityStarter】身份与授权提供器已绑定：消息={}，工作负载={}，数据权限={}",
+            messages is not None,
+            workloads is not None,
+            data_access is not None,
+        )
+        logger.debug(
+            "【SecurityStarter】TokenProvider={} PermissionProvider={} domains={} default_domain={}",
+            type(self.tokens).__qualname__,
+            type(self.permissions).__qualname__,
+            self.settings.domains,
+            self.settings.default_domain,
+        )
+        if self.settings.permission_cache_enabled:
+            await self._call(
+                lambda: self.cache.eval_atomic(self.settings.cache_key(), ("probe",), "return 1")
+            )
+            logger.info("【SecurityStarter】权限缓存原子脚本验证通过")
+        else:
+            logger.info("【SecurityStarter】权限缓存未启用")
+        self._phase = "ready"
+        logger.info("【SecurityStarter】初始化完成：认证域={}", ",".join(self.settings.domains))
+
+    @asynccontextmanager
+    async def _operation(self):
+        if self._phase != "ready":
+            raise SecurityException(SecurityErrorCodes.CLOSED)
+        if ApplicationContext.current() is not self.context.application:
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        self._active += 1
+        self._idle.clear()
+        try:
+            yield
+        finally:
+            self._active -= 1
+            if not self._active:
+                self._idle.set()
+
+    async def _call(self, callback):
+        try:
+            async with asyncio.timeout(self.settings.provider_timeout_seconds):
+                return await callback()
+        except SecurityException:
+            raise
+        except BaseBusinessException as error:
+            if not error.is_system_error:
+                raise
+            raise SecurityException(SecurityErrorCodes.UNAVAILABLE, cause=error) from error
+        except Exception as error:
+            raise SecurityException(SecurityErrorCodes.UNAVAILABLE, cause=error) from error
+
+    def _domain(self, policy: RoutePolicy) -> str:
+        domain = self.settings.default_domain if policy.domain is None else policy.domain
+        if domain not in self.settings.domains:
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        return domain
+
+    async def _lookup(self, token: str, domain: str) -> LoginSession:
+        digest = OpaqueToken.digest(token)
+        session = await self._call(
+            lambda: self.tokens.resolve(
+                digest,
+                application_id=self.settings.application_id,
+                domain=domain,
+            )
+        )
+        if session is None:
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        if not isinstance(session, LoginSession):
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        if session.application_id != self.settings.application_id or session.domain != domain:
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        if not hmac.compare_digest(session.token_digest, digest):
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        return session
+
+    async def _resolve(self, token: str, domain: str) -> LoginSession:
+        session = await self._lookup(token, domain)
+        self._validate(session, domain)
+        return session
+
+    def _validate(self, session: LoginSession, domain: str) -> None:
+        if not isinstance(session, LoginSession):
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        if session.application_id != self.settings.application_id or session.domain != domain:
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        if session.expires_at <= datetime.now(timezone.utc):
+            raise SecurityException(SecurityErrorCodes.EXPIRED)
+        if session.revoked:
+            raise SecurityException(SecurityErrorCodes.REVOKED)
+        if not session.account_enabled:
+            raise SecurityException(SecurityErrorCodes.DISABLED)
+        if session.credential_revision != session.current_credential_revision:
+            raise SecurityException(SecurityErrorCodes.CREDENTIALS)
+
+    def _permission_identifier(self, session: LoginSession) -> str:
+        revision = hashlib.sha256(session.authorization_revision.encode()).hexdigest()
+        return (
+            f"{session.application_id}:{session.domain}:{IdentityBinding.build(session)}:{revision}"
+        )
+
+    async def _snapshot(self, session: LoginSession) -> PermissionSnapshot:
+        binding = IdentityBinding.build(session)
+
+        async def load():
+            snapshot = await self.permissions.snapshot(session, binding=binding)
+            self._validate_snapshot(snapshot, session, binding)
+            return snapshot.model_dump(mode="json")
+
+        if self.settings.permission_cache_enabled:
+            value = await self._call(
+                lambda: self.cache.get_or_load(
+                    self.settings.cache_key(),
+                    self._permission_identifier(session),
+                    load,
+                    self.settings.permission_cache_ttl_seconds,
+                    wait_seconds=self.settings.provider_timeout_seconds,
+                    critical_section_timeout_seconds=self.settings.provider_timeout_seconds,
+                    lease_seconds=self.settings.provider_timeout_seconds + 1,
+                )
+            )
+        else:
+            value = await self._call(load)
+        try:
+            snapshot = PermissionSnapshot.model_validate_json(json.dumps(value))
+        except (TypeError, ValueError) as error:
+            raise SecurityException(SecurityErrorCodes.UNAVAILABLE, cause=error) from error
+        self._validate_snapshot(snapshot, session, binding)
+        return snapshot
+
+    @staticmethod
+    def _validate_snapshot(snapshot, session, binding):
+        if (
+            not isinstance(snapshot, PermissionSnapshot)
+            or snapshot.binding != binding
+            or snapshot.revision != session.authorization_revision
+        ):
+            raise SecurityException(SecurityErrorCodes.UNAVAILABLE)
+
+    async def invalidate_permissions(self, session: LoginSession) -> None:
+        """删除明确版本的缓存；版本推进由业务与权限变更原子提交。"""
+        async with self._operation():
+            if (
+                session.application_id != self.settings.application_id
+                or session.domain not in self.settings.domains
+            ):
+                raise SecurityException(SecurityErrorCodes.INVALID)
+            if self.settings.permission_cache_enabled:
+                await self._call(
+                    lambda: self.cache.delete(
+                        self.settings.cache_key(), self._permission_identifier(session)
+                    )
+                )
+
+    def validate_policy(self, policy: RoutePolicy) -> None:
+        """路由发布前校验当前部署声明的认证域。"""
+        if policy.requires_identity:
+            self._domain(policy)
+
+    async def _check_policy(self, session: LoginSession, policy: RoutePolicy, *, snapshot=None):
+        self.validate_policy(policy)
+        if not policy.requires_identity:
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        if policy.realm is not None and session.realm is not policy.realm:
+            raise SecurityException(
+                SecurityErrorCodes.DENIED, detail=f"会话域不匹配：要求 {policy.realm.value}"
+            )
+        if not self._matches(session.scopes, policy.scopes, policy.scope_mode):
+            raise SecurityException(
+                SecurityErrorCodes.DENIED, detail=f"授权范围不足：需要 {' '.join(policy.scopes)}"
+            )
+        if policy.permissions or policy.roles:
+            snapshot = await self._snapshot(session) if snapshot is None else snapshot
+            check = (
+                PermissionPolicy.all if policy.permission_mode == "all" else PermissionPolicy.any
+            )
+            if policy.permissions and not check(snapshot.permissions, policy.permissions):
+                raise SecurityException(
+                    SecurityErrorCodes.DENIED, detail=f"缺少权限：{','.join(policy.permissions)}"
+                )
+            if not self._matches(snapshot.roles, policy.roles, policy.role_mode):
+                raise SecurityException(
+                    SecurityErrorCodes.DENIED, detail=f"缺少角色：{','.join(policy.roles)}"
+                )
+
+    @staticmethod
+    def _matches(granted, required, mode):
+        if not required:
+            return True
+        return (
+            set(required).issubset(granted)
+            if mode == "all"
+            else not set(required).isdisjoint(granted)
+        )
+
+    @asynccontextmanager
+    async def _authorized_session(self, session: LoginSession, policy: RoutePolicy):
+        self.context._install(session)
+        await self._check_policy(session, policy)
+        async with self._data_scope(session):
+            yield session
+
+    @asynccontextmanager
+    async def _data_scope(self, identity):
+        if self._data_access is None:
+            yield
+        else:
+            manager = self._data_access.enter(identity)
+            await manager.__aenter__()
+            primary = None
+            try:
+                yield
+            except BaseException as error:
+                primary = error
+            finally:
+                await self._exit_provider_scope(manager, primary, "数据权限")
+
+    async def _exit_provider_scope(self, manager, primary, label):
+        # ContextVar token 必须在创建它的 Context 内复位；普通任务复制会破坏它。
+        exit_task = asyncio.Task(
+            manager.__aexit__(
+                type(primary) if primary is not None else None,
+                primary,
+                primary.__traceback__ if primary is not None else None,
+            ),
+            context=asyncio.current_task().get_context(),
+            name="security-scope-exit",
+        )
+        error, cancellation = await CleanupUtils.run_cancellation_safe_cleanup(
+            lambda: exit_task,
+            f"Security {label}作用域清理",
+        )
+        CleanupUtils.raise_collected_cleanup_errors(
+            f"{label}作用域退出失败",
+            [] if error is None else [error],
+            primary_error=primary,
+            caller_cancellation=cancellation,
+        )
+
+    @asynccontextmanager
+    async def authorized(
+        self, token: str, policy: RoutePolicy, *, request_audit: RequestAudit | None = None
+    ):
+        async with self._operation():
+            with self.context._scope(request_audit):
+                session = await self._resolve(token, self._domain(policy))
+                async with self._authorized_session(session, policy):
+                    yield session
+
+    async def run(self, token: str, policy: RoutePolicy, callback, *args, **kwargs):
+        """任务重新验证令牌，不继承调用者的可信身份。"""
+
+        async def invoke():
+            async with self.authorized(token, policy):
+                return await callback(*args, **kwargs)
+
+        return await self.context.application.tasks.run_isolated(invoke)
+
+    async def run_authenticated(self, resolver, policy: RoutePolicy, callback, *args, **kwargs):
+        """服务器认证适配器入口；resolver 必须验证凭证，不能接收客户端 Session DTO。
+
+        例如 WebSocket ticket 消费 SPI。身份仍经与 HTTP 相同的状态、策略和
+        Data Permission 路径；提供者错误不会退化为匿名。每次建立新的 DI/身份边界。
+        """
+
+        async def invoke():
+            async with self._operation():
+                with self.context._scope():
+                    domain = self._domain(policy)
+                    session = await self._call(
+                        lambda: resolver(application_id=self.settings.application_id, domain=domain)
+                    )
+                    self._validate(session, domain)
+                    current = await self._call(
+                        lambda: self.tokens.resolve(
+                            session.token_digest,
+                            application_id=self.settings.application_id,
+                            domain=domain,
+                        )
+                    )
+                    if current is None:
+                        raise SecurityException(SecurityErrorCodes.INVALID)
+                    self._validate(current, domain)
+                    if not hmac.compare_digest(
+                        current.token_digest, session.token_digest
+                    ) or self.session_version(current) != self.session_version(session):
+                        raise SecurityException(SecurityErrorCodes.INVALID)
+                    session = current
+                    async with self._authorized_session(session, policy):
+                        return await callback(session, *args, **kwargs)
+
+        return await self.context.application.tasks.run_isolated(invoke)
+
+    @classmethod
+    def session_version(cls, session: LoginSession):
+        """长连接冻结的身份与授权版本，不含可用作客户端凭证的明文值。"""
+        return (
+            IdentityBinding.build(session),
+            session.authorization_revision,
+            session.credential_revision,
+            session.current_credential_revision,
+            session.dept_id,
+            session.scopes,
+        )
+
+    async def run_session_reference(
+        self, expected: LoginSession, policy: RoutePolicy, callback, *args, **kwargs
+    ):
+        """重新读取已由服务器认证的会话引用；身份/权限版本变化要求重新认证。"""
+
+        async def resolve(*, application_id, domain):
+            return expected
+
+        return await self.run_authenticated(resolve, policy, callback, *args, **kwargs)
+
+    async def allowed_policies(self, policies):
+        """在当前可信执行中一次加载权限，评估一组策略；供有期限的下行快照使用。"""
+        async with self._operation():
+            session = await self._live_current()
+            if self.session_version(session) != self.session_version(self.context.require()):
+                raise SecurityException(SecurityErrorCodes.INVALID)
+            snapshot = await self._snapshot(session)
+            allowed = set()
+            for key, policy in policies.items():
+                try:
+                    await self._check_policy(session, policy, snapshot=snapshot)
+                except SecurityException as error:
+                    if error.error_code is not SecurityErrorCodes.DENIED:
+                        raise
+                else:
+                    allowed.add(key)
+            return frozenset(allowed)
+
+    async def logout(self, token: str, *, domain: str | None = None) -> None:
+        async with self._operation():
+            session = await self._lookup(token, self._domain(RoutePolicy(domain=domain)))
+            # 撤销可能已经提交；取消必须等提供者操作终态，不报告伪成功。
+            try:
+                await AsyncioUtils.run_cancellation_shielded(
+                    self._call(lambda: self.tokens.revoke(session))
+                )
+            finally:
+                self.context.invalidate(session.family_id)
+
+    async def _live_current(self) -> LoginSession:
+        current = self.context.require()
+        latest = await self._call(
+            lambda: self.tokens.resolve(
+                current.token_digest,
+                application_id=self.settings.application_id,
+                domain=current.domain,
+            )
+        )
+        if latest is None:
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        self._validate(latest, current.domain)
+        if latest.token_digest != current.token_digest or IdentityBinding.build(
+            latest
+        ) != IdentityBinding.build(current):
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        return latest
+
+    async def has_permissions(self, *permissions: str, any_of: bool = False) -> bool:
+        """显式业务权限判断重验当前会话，适用于长任务中的再次授权。"""
+        async with self._operation():
+            current = await self._live_current()
+            snapshot = await self._snapshot(current)
+            check = PermissionPolicy.any if any_of else PermissionPolicy.all
+            return bool(permissions) and check(snapshot.permissions, permissions)
+
+    async def has_roles(self, *roles: str, any_of: bool = False) -> bool:
+        async with self._operation():
+            current = await self._live_current()
+            snapshot = await self._snapshot(current)
+            return bool(roles) and (
+                not set(roles).isdisjoint(snapshot.roles)
+                if any_of
+                else set(roles).issubset(snapshot.roles)
+            )
+
+    async def has_scopes(self, *scopes: str, any_of: bool = False) -> bool:
+        async with self._operation():
+            current = await self._live_current()
+            return bool(scopes) and (
+                not set(scopes).isdisjoint(current.scopes)
+                if any_of
+                else set(scopes).issubset(current.scopes)
+            )
+
+    async def require_enum_permission(self, code, enum_class) -> None:
+        async with self._operation():
+            session = await self._live_current()
+            member = enum_class.get_by_code(code)
+            if member is None:
+                raise SecurityException(
+                    SecurityErrorCodes.DENIED, detail=f"未登记的权限枚举：{code}"
+                )
+            permission = member.permission
+            if permission is not None:
+                snapshot = await self._snapshot(session)
+                if not PermissionPolicy.all(snapshot.permissions, (permission,)):
+                    raise SecurityException(
+                        SecurityErrorCodes.DENIED, detail=f"缺少权限：{permission}"
+                    )
+
+    async def issue_message(self, payload: bytes, *, audience: str) -> bytes:
+        async with self._operation():
+            session = self.context.require()
+            if session.realm is not SecurityRealm.ACCOUNT:
+                raise SecurityException(SecurityErrorCodes.DENIED, detail="仅本站会话可签发消息")
+            if self._messages is None or not audience:
+                raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+            if not isinstance(payload, bytes):
+                raise SecurityException(SecurityErrorCodes.INVALID)
+            return await self._call(
+                lambda: self._messages.issue(session, payload, audience=audience)
+            )
+
+    async def run_message(
+        self,
+        proof: bytes,
+        payload: bytes,
+        policy: RoutePolicy,
+        callback,
+        *args,
+        audience: str,
+        **kwargs,
+    ):
+        async def invoke():
+            async with self._operation():
+                with self.context._scope():
+                    if self._messages is None or not audience:
+                        raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+                    if (
+                        not isinstance(proof, bytes)
+                        or not 1 <= len(proof) <= 65536
+                        or not isinstance(payload, bytes)
+                    ):
+                        raise SecurityException(SecurityErrorCodes.INVALID)
+                    domain = self._domain(policy)
+                    session = await self._call(
+                        lambda: self._messages.verify(
+                            proof,
+                            payload,
+                            application_id=self.settings.application_id,
+                            domain=domain,
+                            audience=audience,
+                        )
+                    )
+                    self._validate(session, domain)
+                    if session.realm is not SecurityRealm.ACCOUNT:
+                        raise SecurityException(
+                            SecurityErrorCodes.DENIED, detail="仅本站会话可消费消息"
+                        )
+                    async with self._authorized_session(session, policy):
+                        return await callback(payload, *args, **kwargs)
+
+        return await self.context.application.tasks.run_isolated(invoke)
+
+    async def issue_workload_message(
+        self, payload: bytes, *, audience: str, capability: str
+    ) -> bytes:
+        """系统来源只能传播已认证能力，不能把普通用户会话升级为系统来源。"""
+        async with self._operation():
+            identity = self.context.current_workload()
+            if identity is None or capability not in identity.capabilities:
+                raise SecurityException(
+                    SecurityErrorCodes.DENIED, detail=f"服务身份缺少该能力：{capability}"
+                )
+            if self._messages is None or not audience:
+                raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+            if not isinstance(payload, bytes):
+                raise SecurityException(SecurityErrorCodes.INVALID)
+            return await self._call(
+                lambda: self._messages.issue_workload(
+                    identity,
+                    payload,
+                    audience=audience,
+                    capability=capability,
+                )
+            )
+
+    async def run_workload_message(
+        self,
+        proof: bytes,
+        payload: bytes,
+        callback,
+        *args,
+        audience: str,
+        capability: str,
+        domain: str | None = None,
+        **kwargs,
+    ):
+        """服务身份由消息提供者认证；系统能力必须由消费端显式声明。"""
+
+        async def invoke():
+            async with self._operation():
+                with self.context._scope():
+                    if self._messages is None or not audience or not capability:
+                        raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+                    if (
+                        not isinstance(proof, bytes)
+                        or not 1 <= len(proof) <= 65536
+                        or not isinstance(payload, bytes)
+                    ):
+                        raise SecurityException(SecurityErrorCodes.INVALID)
+                    selected_domain = self._domain(RoutePolicy(domain=domain))
+                    message = await self._call(
+                        lambda: self._messages.verify_workload(
+                            proof,
+                            payload,
+                            application_id=self.settings.application_id,
+                            domain=selected_domain,
+                            audience=audience,
+                        )
+                    )
+                    if not isinstance(message, WorkloadMessage):
+                        raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+                    if message.capability != capability:
+                        raise SecurityException(
+                            SecurityErrorCodes.DENIED,
+                            detail=f"消息能力不匹配：{message.capability}",
+                        )
+                    self._validate_workload(message.identity, selected_domain, audience, capability)
+                    identity = message.identity.model_copy(
+                        update={"capabilities": frozenset({capability})}
+                    )
+                    async with self._workload_scope(identity, capability):
+                        return await callback(payload, *args, **kwargs)
+
+        return await self.context.application.tasks.run_isolated(invoke)
+
+    def _validate_workload(self, identity, domain, audience, capability):
+        if not isinstance(identity, WorkloadIdentity):
+            raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+        if (identity.application_id, identity.domain, identity.audience) != (
+            self.settings.application_id,
+            domain,
+            audience,
+        ):
+            raise SecurityException(SecurityErrorCodes.INVALID)
+        if identity.expires_at <= datetime.now(timezone.utc):
+            raise SecurityException(SecurityErrorCodes.EXPIRED)
+        if capability not in identity.capabilities:
+            raise SecurityException(
+                SecurityErrorCodes.DENIED, detail=f"服务身份缺少该能力：{capability}"
+            )
+
+    @asynccontextmanager
+    async def _workload_scope(self, identity, capability):
+        self.context._install_workload(identity)
+        async with self._data_scope(identity):
+            yield
+
+    @asynccontextmanager
+    async def authorized_workload(self, source: str, *, capability: str, domain: str | None = None):
+        """在当前受管执行中绑定服务身份，用于登录写入等固定服务器入口。"""
+        async with self._operation():
+            with self.context._scope():
+                if self._workloads is None or not source or not capability:
+                    raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+                selected_domain = self._domain(RoutePolicy(domain=domain))
+                identity = await self._call(
+                    lambda: self._workloads.authenticate(
+                        source,
+                        application_id=self.settings.application_id,
+                        domain=selected_domain,
+                        capability=capability,
+                    )
+                )
+                self._validate_workload(identity, selected_domain, source, capability)
+                async with self._workload_scope(identity, capability):
+                    yield identity
+
+    async def run_workload(
+        self,
+        source: str,
+        callback,
+        *args,
+        capability: str,
+        domain: str | None = None,
+        **kwargs,
+    ):
+        """本地 Job 经过服务提供者认证，并创建独立的受管执行。"""
+
+        async def invoke():
+            async with self._operation():
+                with self.context._scope():
+                    if self._workloads is None or not source or not capability:
+                        raise SecurityException(SecurityErrorCodes.CONFIGURATION)
+                    selected_domain = self._domain(RoutePolicy(domain=domain))
+                    identity = await self._call(
+                        lambda: self._workloads.authenticate(
+                            source,
+                            application_id=self.settings.application_id,
+                            domain=selected_domain,
+                            capability=capability,
+                        )
+                    )
+                    self._validate_workload(identity, selected_domain, source, capability)
+                    async with self._workload_scope(identity, capability):
+                        return await callback(*args, **kwargs)
+
+        return await self.context.application.tasks.run_isolated(invoke)
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._phase = "closing"
+            self._close_task = asyncio.create_task(
+                self._close(), name="security-close", context=Context()
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close(self):
+        await self._idle.wait()
+        self._messages = self._workloads = self._data_access = None
+        self._phase = "closed"
+
+    def resources(self) -> dict:
+        return {"state": self._phase, "active_operations": self._active}
