@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://github.com/dushanaicode/dushan-ai-native",
+    "branch": "dev",
+    "commit": "cd21ddf29ea8d3f7134c31eca1b903cac959da75",
+    "product_version": "0.0.0"
+  },
+  "mvp_version": "0.0.0",
+  "upstream_python_packages": {
+    "dushan-admin-backend": "0.0.0",
+    "dushan-admin-backend/framework": "0.0.0",
+    "dushan-admin-backend/module_system": "0.0.0",
+    "dushan-admin-backend/module_infra": "0.0.0"
+  },
+  "frontend_framework": {
+    "name": "Vue Vben Admin",
+    "version": "5.7.0",
+    "node": "24.16.0",
+    "package_manager": "pnpm@11.16.0"
+  },
+  "lockfiles": {
+    "dushan-admin-backend/poetry.lock": "6c4fbec2a8dd5227a0b7c2ddece52ab8c2125750dc72c5308b2d747aadb71d1c",
+    "dushan-admin-frontend/pnpm-lock.yaml": "6c824252482dac064c7c1942833a9a65c10432e5493f6d01f643a578d0188f8e"
+  },
+  "policy": "MVP follows the upstream product version; the exact upstream commit identifies the source baseline. Vben version is tracked separately. Local adaptations do not imply a new upstream release.",
+  "frontend_app": {
+    "name": "@vben/web-ele",
+    "version": "5.8.0"
+  },
+  "frontend_package_versions": {
+    "package.json": "5.7.0",
+    "docs/package.json": "5.8.0",
+    "playground/package.json": "5.8.0",
+    "apps/web-antd/package.json": "5.8.0",
+    "apps/web-antdv-next/package.json": "5.8.0",
+    "apps/web-ele/package.json": "5.8.0",
+    "apps/web-naive/package.json": "5.8.0",
+    "apps/web-tdesign/package.json": "5.8.0",
+    "internal/node-utils/package.json": "5.8.0",
+    "internal/tailwind-config/package.json": "5.8.0",
+    "internal/tsconfig/package.json": "5.8.0",
+    "internal/vite-config/package.json": "5.8.0",
+    "internal/lint-configs/commitlint-config/package.json": "5.8.0",
+    "internal/lint-configs/eslint-config/package.json": "5.8.0",
+    "internal/lint-configs/oxfmt-config/package.json": "5.8.0",
+    "internal/lint-configs/oxlint-config/package.json": "5.8.0",
+    "internal/lint-configs/stylelint-config/package.json": "5.8.0",
+    "packages/constants/package.json": "5.8.0",
+    "packages/icons/package.json": "5.8.0",
+    "packages/locales/package.json": "5.8.0",
+    "packages/preferences/package.json": "5.8.0",
+    "packages/stores/package.json": "5.8.0",
+    "packages/styles/package.json": "5.8.0",
+    "packages/types/package.json": "5.8.0",
+    "packages/utils/package.json": "5.8.0",
+    "packages/@core/composables/package.json": "5.8.0",
+    "packages/@core/preferences/package.json": "5.8.0",
+    "packages/@core/base/design/package.json": "5.8.0",
+    "packages/@core/base/icons/package.json": "5.8.0",
+    "packages/@core/base/shared/package.json": "5.8.0",
+    "packages/@core/base/typings/package.json": "5.8.0",
+    "packages/@core/ui-kit/form-ui/package.json": "5.8.0",
+    "packages/@core/ui-kit/layout-ui/package.json": "5.8.0",
+    "packages/@core/ui-kit/menu-ui/package.json": "5.8.0",
+    "packages/@core/ui-kit/popup-ui/package.json": "5.8.0",
+    "packages/@core/ui-kit/shadcn-ui/package.json": "5.8.0",
+    "packages/@core/ui-kit/tabs-ui/package.json": "5.8.0",
+    "packages/effects/access/package.json": "5.8.0",
+    "packages/effects/common-ui/package.json": "5.8.0",
+    "packages/effects/hooks/package.json": "5.8.0",
+    "packages/effects/layouts/package.json": "5.8.0",
+    "packages/effects/plugins/package.json": "5.8.0",
+    "packages/effects/request/package.json": "5.8.0",
+    "scripts/turbo-run/package.json": "5.8.0",
+    "scripts/vsh/package.json": "5.8.0"
+  }
+}
