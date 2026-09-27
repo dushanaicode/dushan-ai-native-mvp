@@ -1,0 +1,11 @@
+Temp/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage*
+logs/
+application-local.yaml
+.env
+.env.*
+!.env.example

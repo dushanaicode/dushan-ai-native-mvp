@@ -1,0 +1,47 @@
+[project]
+name = "dushan-admin-backend"
+version = "0.0.0"
+description = "dushan-ai-native 后端启动骨架"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+dynamic = ["dependencies"]
+
+[tool.poetry.dependencies]
+# 主项目只关联已经存在的模块；模块依赖由各自的 pyproject.toml 维护。
+framework = { path = "./framework", develop = true }
+module-system = { path = "./module_system", develop = true }
+module-infra = { path = "./module_infra", develop = true }
+
+[tool.poetry.group.core.dependencies]
+# 应用工厂、配置、日志上下文和 ASGI 引擎直接使用的依赖。
+fastapi = "==0.137.1"
+pydantic = "==2.13.4"
+loguru = "==0.7.3"
+uvicorn = { extras = ["standard"], version = "==0.49.0" }
+granian = "==2.7.6"
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.database-domestic]
+optional = true
+
+[tool.poetry.group.database-domestic.dependencies]
+# 国产专用驱动按组选择，默认 MySQL/PG 安装不强制引入厂商二进制。
+framework = { path = "./framework", develop = true, extras = ["opengauss", "dameng"] }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["Temp"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "framework", "fixtures", "module_system", "module_infra", "server"]
+
+[tool.ruff.lint.per-file-ignores]
+# 启动入口必须先禁用字节码写入，再导入项目模块；保留此执行顺序。
+"app.py" = ["E402"]

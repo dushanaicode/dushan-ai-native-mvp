@@ -1,0 +1,511 @@
+# 公共默认配置；环境文件只写差异，同一分组按字段递归合并。
+# 覆盖顺序：本文件 → 所选环境文件 → 非生产个人覆盖 → 进程环境变量。
+# 后端使用 application*.yaml，不加载 .env；本机私密配置写入已忽略的 application-local.yaml。
+
+# ==================== 应用服务配置 ====================
+server:
+  name: dushan-ai-native # 应用名称，显示在启动摘要和接口文档中
+  version: "0.0.0" # 应用版本，供健康检查和接口文档使用
+  env: dev # 默认环境；--env 优先于 SERVER_ENV，再采用此值
+  engine: granian # 默认 HTTP 引擎；--server 优先于 SERVER_ENGINE，再采用此值
+  host: 127.0.0.1 # 默认监听回环地址；对外访问时按部署方式配置
+  port: 48080 # HTTP 端口，范围 1～65535；可通过 SERVER_PORT 覆盖
+  debug: false # 调试开关；生产环境禁止开启
+  reload: false # 热重载开关，由开发环境配置开启；生产环境禁止开启
+  docs_enabled: true # Swagger/ReDoc/OpenAPI 接口文档开关，与独立文档站无关
+  docs_url: /docs # Swagger 页面路径
+  redoc_url: /redoc # ReDoc 页面路径
+  openapi_url: /openapi.json # OpenAPI 文档路径
+  root_path: "" # 反向代理的挂载路径前缀，直接访问时留空
+
+# ==================== HTTP Web 边界 ====================
+web:
+  max_body_bytes: 10485760 # 普通正文总量 10 MiB；消费时逐块计数，不预读或缓存
+  max_multipart_bytes: 53477376 # multipart 总 envelope 51 MiB；单文件业务限制仍由上传业务声明
+  cors_origins: [] # 允许的浏览器 origin，例如 https://admin.example.com；空数组不开放跨域
+  cors_credentials: true # 携带凭据时不允许使用通配符
+  cors_methods: [GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS]
+  cors_headers: [Accept, Accept-Language, Authorization, Content-Type, Traceparent, Tracestate, Terminal]
+  cors_expose_headers: [Content-Disposition, ETag, Retry-After, Trace-Id, WWW-Authenticate]
+  cors_max_age: 86400 # 浏览器预检缓存秒数
+  gzip_enabled: true # 使用 Starlette，保留 Range、SSE 及已编码内容的原生处理规则
+  gzip_minimum_size: 1000 # 小响应不压缩
+  gzip_compresslevel: 9 # 0～9，沿用原压缩级别
+  access_log_enabled: true # 仅记录路由模板、状态、字节数、耗时，不读取请求/响应正文
+
+# ==================== Loguru 日志配置 ====================
+log:
+  root_dir: server/logs # 文件日志目录，相对路径以配置目录为基准；可通过 LOG_ROOT_DIR 覆盖
+  enable_file_overall: true # 文件日志总开关；关闭后不会创建日志目录
+  enable_json_format: false # 是否额外输出包含上下文字段的 JSONL 日志
+  loadtest_mode: false # 压测模式强制关闭文件日志，并将控制台阈值设为 WARNING
+  console_level: INFO # TRACE/DEBUG/INFO/SUCCESS/WARNING/ERROR/CRITICAL；NONE 关闭控制台
+  file_active_types: [info, warning, error] # 启用的文件类型：info、warning、error
+  rotation_size: "20 MB" # 单文件达到此大小后轮转
+  enqueue: true # 使用队列写入；应用退出时先排空队列
+  compression: zip # 轮转或关闭后压缩，null 表示不压缩
+  file_level_info: INFO # info 文件的最低日志级别
+  retention_info: "7 days" # info 文件保留时间
+  file_level_warning: WARNING # warning 文件的最低日志级别
+  retention_warn: "15 days" # warning 文件保留时间
+  file_level_error: ERROR # error 文件的最低日志级别
+  retention_error: "30 days" # error 文件保留时间
+
+# ==================== 启动横幅配置 ====================
+banner:
+  enabled: true # 展示总开关；常规生命周期日志仍由 log 配置控制
+  show_logo: true # 显示完整 DUSHAN / AI NATIVE / NO BUG 字符横幅
+  show_worship: false # 显示旧版祈福图案，可按需开启
+  show_mascot: true # 显示虚拟形象小猫动画 (TUI Cat Mascot)
+  show_startup_info: true # 显示应用版本、环境、监听地址及已开启的接口文档入口
+  author: DUSHAN # 展示作者，空字符串表示不显示
+  documentation_url: "" # 可选项目文档站地址；空字符串表示不显示，不内置外部站点链接
+
+# ==================== 配置模型与运行覆盖 ====================
+config:
+  models: # 模型通过自身环境前缀覆盖字段，例如 DATABASE_ENABLED
+    infra_backup:
+      enabled: false
+      executable: mysqldump # 由部署提供客户端程序；在后端所在宿主或容器内执行
+      output_directory: Temp/infra-backups
+      timeout_seconds: 600
+    system:
+      owner_user_id: '10100000010001' # 唯一作者账号；仅部署配置可调整，角色分配不能转授此身份
+      user_register_enabled: false # 管理后台自助注册；须与前端 VITE_APP_REGISTER_ENABLE 同时开启
+      allow_modify_system_role: false
+      default_client_id: default
+      default_password: null
+      code_expire_seconds: 300
+      approve_expire_seconds: 2592000
+      refresh_cookie_name: system_refresh
+      refresh_cookie_secure: true
+      allowed_origins: []
+      workload_credential: null # 本站后台任务凭据，由部署配置提供
+      message_signing_key: null # MQ 身份证明密钥，至少 32 字节
+      sms_callback_token: null # 厂商回调地址中的校验凭据
+      message_lifetime_seconds: 300
+    sms_captcha:
+      debug_enabled: false # 仅 dev 环境白名单手机号可获得虚拟登录码 8888
+      debug_mobiles: [] # 空名单不启用任何手机号；调试码仍需先获取且只能使用一次
+      expire_times: 600
+      max_attempts: 5 # 只校验最新一条验证码；错误累计达到次数后必须重新获取
+      send_frequency: 60
+      send_maximum_quantity_per_day: 20
+      begin_code: 1000
+      end_code: 9999
+    qr_login:
+      enabled: true # 第一方扫码登录；同时开启前端 VITE_APP_QR_LOGIN_ENABLE
+      expire_seconds: 180 # 手机确认及电脑领取的总有效期
+    password_reset:
+      mail_template_code: admin-reset-password # 邮件模板编码；模板须关联实际 SMTP 账号
+      expire_seconds: 600
+      resend_seconds: 60
+      max_attempts: 5
+      max_daily: 20
+    notification_delivery:
+      delivery_claim_lease_seconds: 300
+      outbox_processing_lease_seconds: 300
+      outbox_terminal_retention_days: 30
+      outbox_batch_size: 100
+    websocket:
+      enabled: false
+      path: /api/ws
+      transport: local # local 必须单 worker；redis 为可丢广播
+      namespace: dushan-ai-native
+      cache_client: default
+      signing_secret: null # redis transport 启用时必须显式配置
+      allowed_origins: [] # 启用时明确白名单，不接受通配
+      subprotocols: [] # 空表示不协商子协议；客户端未知子协议明确拒绝
+      max_connections: 1000 # 下列连接限额均为单实例
+      max_connections_per_member: 5
+      max_pending_handshakes: 100
+      handshake_timeout_seconds: 10.0
+      command_timeout_seconds: 3.0
+      send_timeout_seconds: 5.0
+      handler_timeout_seconds: 120.0
+      shutdown_seconds: 10.0
+      max_message_bytes: 65536
+      inbound_queue_size: 16
+      outbound_queue_size: 64
+      handler_concurrency: 1 # 默认同连接保序
+      heartbeat_interval_seconds: 30.0
+      heartbeat_timeout_seconds: 90.0
+      authorization_refresh_seconds: 10.0
+      authorization_timeout_seconds: 2.0
+      authorization_concurrency: 256
+      instance_lease_seconds: 30.0
+      instance_renew_seconds: 5.0
+      transport_poll_seconds: 0.1
+      transport_restart_seconds: 1.0
+      envelope_max_age_seconds: 10.0
+      online_query_limit: 1000
+    mq: # 消费者由代码声明，覆盖只允许启停、并发与预取
+      reconnect_initial_seconds: 1.0
+      reconnect_max_seconds: 10.0 # 单次请求仍受 command_timeout_seconds 限制
+      reconnect_alert_after: 5 # 达到阈值升级日志；保持有界频率恢复，直到关闭
+      enabled: false
+      backend: redis # redis: stream/pubsub；rabbitmq: queue；kafka: topic
+      namespace: dushan-ai-native
+      cache_client: default # Redis 与防重放均复用 Cache 连接
+      signing_secret: null # 启用时必须显式配置至少 32 字节密钥
+      max_age_seconds: 2592000
+      clock_skew_seconds: 30.0
+      replay_retention_seconds: 2678400
+      lease_seconds: 60.0
+      renew_seconds: 10.0
+      command_timeout_seconds: 5.0
+      handler_timeout_seconds: 300.0
+      shutdown_seconds: 30.0
+      poll_seconds: 0.1
+      concurrency: 4
+      prefetch: 16
+      max_consumers: 100
+      max_concurrency: 64
+      max_prefetch: 256
+      max_message_bytes: 262144
+      max_proof_bytes: 65536
+      stream_max_length: 100000 # 无法安全裁剪已确认历史时拒绝新发布
+      retry_max_length: 10000
+      dead_letter_max_length: 10000
+      dead_letter_retention_seconds: 604800
+      max_retry_delay_seconds: 3600.0
+      overrides: {}
+      unknown_override: fail # ignore 仍记录被忽略的 key
+      rabbit_url: null
+      rabbit_ca_file: null
+      kafka_bootstrap_servers: []
+      kafka_security_protocol: PLAINTEXT
+      kafka_sasl_mechanism: null
+      kafka_sasl_username: null
+      kafka_sasl_password: null
+      kafka_ca_file: null
+      kafka_cert_file: null
+      kafka_key_file: null
+      kafka_partitions: 1
+      kafka_replication_factor: 1
+      kafka_retention_bytes: 268435456 # 每分区保留上界；Kafka 不提供按条数硬限
+      outbox_enabled: false # 开启必须装配 Database、Job 与业务 OutboxProvider
+      outbox_batch_size: 100
+      outbox_max_attempts: 10
+      outbox_lease_seconds: 30.0
+      outbox_retry_seconds: 10.0
+      outbox_retention_seconds: 604800
+    job: # 业务定义 SPI 为权威，调度器只保存内存副本
+      reconnect_initial_seconds: 1.0
+      reconnect_max_seconds: 10.0
+      reconnect_alert_after: 5
+      enabled: false
+      owner_enabled: false # 仅显式调度进程开启；必须单 worker 并取得 Redis 租约
+      namespace: dushan-ai-native
+      cache_client: default
+      timezone: null # 显式继承 datetime.timezone
+      reconciliation_seconds: 30.0
+      poll_seconds: 0.1
+      owner_lease_seconds: 15.0
+      owner_renew_seconds: 3.0
+      command_timeout_seconds: 5.0
+      misfire_grace_seconds: 60 # 只在宽限内合并补跑一次，与重试无关
+      pending_limit: 1000
+      concurrency: 8
+      shutdown_seconds: 30.0
+      record_timeout_seconds: 3.0
+      result_max_length: 4000
+      max_jobs: 10000
+      max_retry_seconds: 300.0
+    data_permission: # 启用前提供业务规则和身份认证；未声明模型明确拒绝
+      enabled: false
+      snapshot_seconds: 60.0 # 同一授权执行固定快照，过期拒绝而不中途刷新
+      provider_timeout_seconds: 10.0
+      in_clause_chunk_size: 500
+      cache_enabled: false # 可选跨执行缓存，复用 Cache 的回源与失效机制
+      cache_client: default
+      cache_ttl_seconds: 60
+      rule_version: "1" # 业务规则解释变化时推进，权限数据变化推进 authorization_revision
+    security: # 本站可信身份；业务通过 TokenProvider/PermissionProvider 接入
+      enabled: false # 关闭不会把已声明受保护的路由变为公开
+      application_id: dushan-ai-native # 令牌与权限缓存的应用隔离标识
+      domains: [admin] # 服务端认证域，不能从请求头选择
+      default_domain: admin
+      permission_cache_enabled: false # 启用时复用 Cache，实时会话状态仍逐次查询
+      permission_cache_client: default
+      permission_cache_ttl_seconds: 60 # 秒；缓存绑定完整主体及权威授权版本
+      provider_timeout_seconds: 10.0 # 外部提供者的单次调用期限
+      bcrypt_rounds: 12 # bcrypt 2b 工作因子，允许 12～16
+      password_concurrency: 4 # 每应用并行密码计算上限
+      bizlog_enabled: false # 同时启用 expression.enabled，并提供真实 LogRecordProvider
+      bizlog_renew_seconds: 60.0 # 持久审计预留的续租间隔
+      bizlog_max_length: 4096 # 审计正文上限，超出带明确截断标记
+      bizlog_max_diff_items: 32 # 单次差异字段上限
+    auth: # 第三方授权；业务应用凭据也可通过 AuthClientProvider SPI 提供
+      enabled: false
+      namespace: dushan # 同一部署的 worker 共享；独立部署必须使用不同命名空间
+      client_name: default
+      state_ttl_seconds: 300
+      operation_timeout_seconds: 30.0 # 包含配置、缓存、授权交换和用户资料的总上限
+      http_timeout_seconds: 10.0
+      max_connections: 32
+      max_response_bytes: 1048576
+      allow_loopback_http: false # 本地联调可显式允许回环 HTTP，其他地址必须 HTTPS
+      proxy: null # 仅使用显式代理，不读取环境代理
+      jwks_ttl_seconds: 3600
+      jwks_refresh_cooldown_seconds: 30.0
+      jwks_max_keys: 32
+      oidc_leeway_seconds: 60
+      credential_ttl_seconds: 7200
+      credential_expiry_margin_seconds: 60
+      tracing_enabled: true
+      clients: [] # 每项明确 application_id/source/enabled/revision、凭据、回调、scopes/pkce/options
+    protection:
+      enabled: false # 显式启用时必须同时启用 Cache；故障不会被解释为关闭
+      client_name: default # 复用 Cache 具名客户端，不另建连接池
+      key_prefix: protection # 多 worker 使用同一前缀；不同部署可更换前缀隔离
+      io_timeout_seconds: 1.0 # 单次原子操作上界；不自动重放写命令
+      shutdown_timeout_seconds: 30.0 # 关闭时等待已进入的业务和清理
+      max_inflight: 1024 # 本应用在途操作与未关闭租约的容量上限
+      max_key_bytes: 65536 # 业务参数规范化后的最大字节数
+      tracing_enabled: true # 有已启用的 Monitor 时绑定观测接点
+      rate_limit_enabled: true
+      rate_limit:
+        algorithm: fixed # fixed 从首次成功起算；sliding 为精确滑动窗口
+        capacity: 100 # 窗口内额度，也是允许的瞬时突发量
+        window_ms: 1000 # 毫秒；预留接口将此值作为每个槽位的有效期
+      rate_failure_policy: block # 规则未指定 failure_policy 时使用；可显式覆盖为 block/allow，allow 仅对可用性故障降级
+      circuit_failure_threshold: 5 # 连续基础设施失败后打开本应用限流熔断器
+      circuit_reset_seconds: 30.0 # 恢复等待后仅允许一个探针，不影响 owner 清理
+      lock_enabled: true
+      lock:
+        lease_ms: 30000 # 有限租约；无自动续租、不可重入
+        wait_ms: 0 # 竞争等待预算，0 表示只尝试一次；单次 I/O 另有上界
+        execution_timeout_ms: 25000 # 必须小于租约；只能协作式取消，不能回滚副作用
+      idempotency_enabled: true
+      idempotency:
+        mode: fixed # fixed 保留窗口；delete_on_complete 成功释放；sliding 重复时刷新
+        ttl_ms: 60000 # 占位有效期；不保存业务返回值
+        max_lifetime_ms: 300000 # 滑动刷新的绝对上界，防止持续重复造成永久占位
+        failure_action: retain # release 仅适用于调用方显式声明无副作用的失败
+    monitor:
+      enabled: false # 关闭时不创建 SDK Provider、Exporter 或后台线程
+      # service_name/service_version 映射上面的 server.name/server.version，不重复维护默认值
+      instance_id: null # null 在资源打开时生成本应用实例标识
+      sampler: parentbased_traceidratio # always_on/off、traceidratio 及其 parentbased_ 版本
+      sample_ratio: 0.1 # 无有效父Span时的根采样比例
+      exporter: otlp # OTLP gRPC 可发送本地接收端用于调试；none 明确不导出
+      endpoint: http://127.0.0.1:4317 # gRPC collector，https 使用SDK默认信任根
+      export_headers: {} # 可选小写认证 metadata，值按 SecretStr 处理
+      export_timeout_seconds: 1.0 # SDK单批RPC及重试的共同预算
+      flush_timeout_seconds: 5.0 # flush期间只排空已接纳集合，新记录计入丢弃诊断
+      shutdown_timeout_seconds: 5.0 # 预算不足的剩余批次计数丢弃，随后释放线程和连接
+      max_queue_size: 512 # 包括正在导出的Span，避免队列外另存无界副本
+      max_batch_size: 64
+      schedule_delay_millis: 1000
+      max_attributes: 32
+      max_attribute_length: 256 # 字符串按UTF-8字节截断
+      max_events: 4
+      attribute_keys: [] # 额外属性必须显式列名；敏感字段和原始SQL/异常文本禁止开启
+      propagators: [tracecontext] # 可选 baggage，但必须同时配置白名单
+      baggage_keys: [] # 仅用于显式传播，不自动写入Span，也不能用于鉴权
+      max_propagation_bytes: 4096
+      http_enabled: true
+      excluded_paths: [/docs, /openapi.json, /health, /healthz, /livez, /readyz]
+      response_trace_header: true # 只返回本地服务端Span的trace-id
+      query_enabled: true # 使用现有QueryObserver，不做SQLAlchemy自动插桩
+      capture_business_ids: false # 启用后仍只读取装饰器显式指定的参数
+      capture_generated_ids: false # 只观察已存在数据库作用域的ID增量，不改变主键或清空列表
+      max_generated_ids: 16
+      performance_medium_ms: 1000.0
+      performance_slow_ms: 5000.0
+    # ===== 验证码：默认关闭，启用前须开启 Cache =====
+    captcha:
+      enabled: false
+      provider: block_puzzle # block_puzzle / click_word / aliyun / tencent
+      purposes: [login, register, password_reset] # 业务入口指定用途；消费凭证时必须匹配
+      client_name: default # 复用 Cache 中已声明的客户端
+      challenge_ttl_seconds: 180 # 挑战有效期，尝试不会刷新 TTL
+      verification_ttl_seconds: 60 # 挑战通过后的业务凭证有效期，只能消费一次
+      max_attempts: 3 # 每次提交预扣一次；非法载荷及服务失败不返还
+      slider_tolerance: 5.0 # 原图像素，滑块条只沿 x 轴移动，提交 y=0
+      click_tolerance: 10.0 # 原图像素，按 word 列表顺序点击，使用圆形容差
+      generation_concurrency: 4 # 每进程在途生成上限，超出直接拒绝；线程池按此大小创建
+      generation_limit: 120 # 窗口内最多创建的挑战数；计数在 Redis 共享，多 worker 合用同一配额
+      generation_window_seconds: 60 # Redis 原子固定窗口，秒
+      interference: 1 # 图片干扰级别：0 / 1 / 2
+      background_dir: null # 留空使用随包背景图；填目录则改用自有图片，需为 jpg/jpeg/png 且能解码
+      watermark: 渡山 # 最多 16 字符，须属于随包字体字符集
+      tracing_enabled: false # 通过 OpenTelemetry API 接入宿主已配置的 tracer
+      cloud_timeout_seconds: 5.0 # 包括读取响应的总超时，不隐式重试
+      cloud_max_connections: 10
+      cloud_max_response_bytes: 32768 # 禁止压缩响应，读取时限制字节数
+      aliyun:
+        access_key_id: "" # 实际凭据填写在私有 application 配置中，不写入版本化文件
+        access_key_secret: ""
+        scene_id: ""
+        prefix: ""
+        region: cn # cn / sgp，与 endpoint 必须对应
+        language: cn # cn / en
+        endpoint: captcha.cn-shanghai.aliyuncs.com
+      tencent:
+        app_id: 0 # 实际应用信息填写在私有 application 配置中
+        app_secret: ""
+        secret_id: ""
+        secret_key: ""
+    database:
+      enabled: false # 填写来源后开启；关闭时不导入驱动或连接数据库
+      sources: [] # 启用时仅配置一项 name/url/role/pool/tls；role=primary，pool=null 继承下方池配置
+      # tls=null 不启用 TLS；启用时填写 ca_file/certificate_file/private_key_file（可为 null），始终校验证书和主机名。
+      pool:
+        size: 10 # 每个端点、每个应用进程的常驻连接数
+        max_overflow: 20 # 高峰期临时连接上限；0 禁止溢出
+        timeout_seconds: 30.0 # 连接池借用等待秒数
+        recycle_seconds: 3600 # 回收连接年龄秒数；-1 不按年龄回收
+        pre_ping: true # 借出前探活，失效连接由 SQLAlchemy 丢弃
+      connect_timeout_seconds: 10.0 # 启动和健康探测的总超时秒数
+      health_check_enabled: true # 后台探活；启动时主库探活始终执行
+      health_check_interval_seconds: 30.0
+      slow_query_enabled: true # 输出安全观测字段，绝不输出原始 SQL 或参数
+      slow_query_threshold_ms: 500.0
+      query_observation_enabled: true # 同步安全查询事件；关闭后不调用 observer
+      query_template_enabled: false # 模板仅保留白名单 SQL 结构，标识符和字面值均脱敏
+      query_fingerprint_enabled: true # 安全模板的 SHA-256，不对原始 SQL 或参数计算摘要
+      query_sample_rate: 1.0 # 查询事件采样率；慢查询诊断独立启用
+      query_max_statement_length: 65536 # 超限不解析模板/指纹，避免无界观测开销
+      query_max_template_length: 1024 # 模板输出字符上限
+      soft_delete_enabled: true # 默认过滤 BaseDO 已删除记录
+      audit_enabled: true # 自动填充当前作用域账户；UTC 时间始终由模型策略填写
+      id_strategy: database # framework 可使用自增；启用 system/infra 时必须设为 snowflake 并分配机器号
+      snowflake_machine_id: null # snowflake 必须显式分配 0～1023；同机器号不能被多进程同时使用
+      after_commit_result_limit: 100 # 最近提交后动作结果的最大条数
+    cache:
+      enabled: false # 填写 Redis 地址后开启；关闭时不建立连接，缓存组件调用会明确报未就绪
+      host: 127.0.0.1 # Redis 主机地址；本轮只支持单机部署，哨兵与集群未迁入
+      port: 6379 # Redis 端口，范围 1～65535
+      username: null # Redis 用户名；填写时必须同时填写密码
+      password: null # Redis 密码，通过 CACHE_PASSWORD 注入，不写入版本库
+      clients: # 本应用建立的逻辑客户端；CacheKey 的 client_name 只能引用这里的 name
+        - { name: default, db: 0 }
+      default_client: default # 分布式锁等没有业务前缀的操作使用的客户端
+      max_connections: 50 # 每个客户端、每个应用进程的连接池上限
+      pool_wait_timeout_seconds: 10.0 # 连接池借用等待秒数；超时按缓存操作失败上报，不静默排队
+      socket_timeout_seconds: 5.0 # 单条命令的读写超时秒数
+      socket_connect_timeout_seconds: 5.0 # 建立连接的超时秒数
+      connection_health_check_seconds: 30.0 # 空闲连接借出前的探活间隔；0 表示不探活
+      max_ttl_seconds: 2592000 # 单次写入允许的最大存活秒数，超过直接拒绝
+      null_value_enabled: true # 回源结果为空时写入空值，防止同一个不存在的键反复穿透
+      null_value_ttl_seconds: 60 # 空值缓存的独立存活秒数，必须明显短于正常数据
+    ip:
+      enabled: false # 显式启用后按应用加载地区/XDB；普通导入与未启用应用不读大型资源
+      area_csv_path: null # null 使用入包地区数据；自定义路径必须是绝对路径
+      local_enabled: true # 本地 IPv4/IPv6 查询不依赖外网
+      local_families: [ipv4, ipv6] # 按需选择；每进程 XDB 数据约 IPv4 11 MB、IPv6 37 MB，多 worker 分别持有
+      local_data_dir: null # null 使用入包 manifest/XDB；自定义目录必须是绝对路径
+      online_enabled: false # 在线查询单独启用
+      online_providers: [pconline, vore] # 在线查询顺序
+      online_timeout_seconds: 2.0 # 每个在线请求的连接/读写超时秒数
+      query_budget_seconds: 5.0 # 整次归属地查询的总预算秒数
+      online_failure_policy: continue # continue 保留失败信息并尝试下一 Provider；raise 立即抛错
+      online_max_connections: 20 # 每个应用在线客户端的连接总量上限
+      online_max_response_bytes: 65536 # 在线响应字节上限
+      pconline_api_url: https://whois.pconline.com.cn/ipJson.jsp
+      vore_api_url: https://api.vore.top/api/IPdata
+      trusted_proxy_cidrs: [] # 仅信任显式 CIDR 中的直连代理，默认忽略转发头
+      cache_max_size: 1024 # 应用内归属地结果缓存上限；0 禁用，不依赖 Cache Starter
+      cache_ttl_seconds: 3600.0 # 已知结果保留秒数
+      unknown_cache_ttl_seconds: 60.0 # 未知结果保留秒数；0 不缓存未知结果
+    excel:
+      header_font_bold: true # 导出与模板表头使用粗体
+      header_font_size: 11 # 表头字号
+      auto_adjust_column_width: true # 按显示值调整列宽，仍受下方上下限约束
+      min_column_width: 10 # Excel 字符宽度单位
+      max_column_width: 60
+      max_import_rows: 10000 # 不含表头的数据行上限
+      max_concurrent_imports: 1 # 每应用同时解析的导入数；等待期间不加载工作簿，避免并发内存叠加
+      max_export_rows: 10000
+      max_columns: 200 # 工作表列上限
+      max_cells: 200000 # 单次处理的单元格数量上限
+      max_upload_size_bytes: 10485760 # XLSX 压缩文件最大字节数
+      max_archive_entries: 1000 # ZIP 条目数上限
+      max_uncompressed_size_bytes: 104857600 # 全部 ZIP 条目的解压字节总量上限
+      max_cell_text_length: 32767 # 单元格文本长度上限
+      max_errors: 100 # 收集到此数量的定位错误后停止导入
+      max_dropdown_options: 10000 # 每列下拉选项上限
+      template_rows: 100 # 模板预设数据校验行数
+      money_decimal_places: 2 # 金额转换小数位数
+      formula_policy: reject # reject 拒绝导入公式；literal 保留公式文本，不计算公式
+      unknown_columns: reject # reject 拒绝未知表头；ignore 忽略未知列
+  source_order: [environment, memory, external, file, yaml] # 优先级从高到低；模型/字段可显式收紧
+  files: [] # [{path: config-overrides.yaml, required: true}]；后列文件覆盖先列同名键
+  reload_enabled: false # 显式内存/文件/外部快照刷新；不启动后台监听线程
+  max_source_bytes: 1048576 # 单个附加文件读取上限，单位字节
+  max_source_items: 10000 # 每份展开配置的最大键数，防止循环或过大输入
+
+# ==================== 依赖注入容器 ====================
+di:
+  enabled: true # false 不评估 DI 条件、不创建组件；配置模型与错误码仍独立可用
+  default_scope: singleton # 未在装饰器显式指定时使用；可选 singleton、transient
+  hook_timeout_seconds: 30.0 # 异步生命周期协作取消期限，不能强制终止阻塞用户代码
+  lookup_enabled: true # 开放 get_bean；关闭后注入仍可用，但 system 模块的服务身份作用域依赖 get_bean，启用 system 时必须保持开启
+  automatic_context_binding: true # HTTP/WebSocket 入口自动绑定上下文；关闭后须显式建立执行边界
+  drain_timeout_seconds: 30.0 # 超时后协作取消受管任务，仍等实际执行结束再释放依赖
+  metrics_enabled: true # 关闭可选解析计时和计数，不关闭必要错误与资源检查
+  task_error_limit: 100 # 保留最近 N 项后台任务失败供关闭汇总；每次失败仍即时记录日志，累计计数不受截断影响
+
+# ==================== 模块声明配置 ====================
+modules:
+  packages: [framework, module_system, module_infra] # 允许定位的已安装普通包，各自提供 module.toml；不会执行声明包
+  enabled: [framework] # 配置数据库、安全和缓存后显式加入 system；空列表表示不启用模块
+
+# ==================== Python 定义扫描 ====================
+scanner:
+  enabled: true # 仅控制自动遍历；模块声明、语言资源与 module.toml 的显式 definitions 独立加载
+  component_types: null # null 全部；[] 不导入候选；可选 component、error_code、config_model
+  include_packages: null # null 全部；[] 不扫描；完整包前缀，例如 module_account.definitions
+  exclude_packages: [] # 优先于 include，排除包及其全部子模块；环境列表使用 JSON 数组
+  ignored_directories: [__pycache__, temp] # 扫描根内按目录名（不区分大小写）跳过的子目录，不校验不导入；[] 只跳过点开头的隐藏目录
+  diagnostics_enabled: true # 开启分阶段耗时、跳过原因与慢导入统计；不改变来源校验
+  diagnostic_limit: 10 # 跳过样例和慢模块各自最多保留多少项（1–100）
+
+# ==================== 国际化配置 ====================
+# 环境变量使用 I18N_ 前缀，如 I18N_DEFAULT_LOCALE=en-US。
+# supported_locales/resource_roots/scopes 的环境变量值使用 JSON 数组。
+page:
+  default_size: 10 # 请求省略 pageSize 时采用；页码固定从1开始
+  max_size: 200 # 普通分页单页上限；可由 PAGE_MAX_SIZE 覆盖
+  fetch_all_enabled: false # 全量读取总开关；还需服务端显式启用，不能代替业务鉴权
+  fetch_all_max_rows: 5000 # 全量读取平台上限，接口只能收紧
+  max_sort_fields: 5 # 一次请求的排序字段上限，0 表示禁止客户端排序
+
+# ==================== 响应与下载配置 ====================
+response:
+  download_cache: no-store # no-store 禁止保存；private/public 需业务确认内容可缓存
+  download_max_age: 0 # private/public 缓存有效期秒数；no-store 模式不使用
+  max_memory_bytes: 10485760 # 预生成内存下载上限，超过时使用磁盘或生成器
+  file_chunk_size: 65536 # 标准文件响应读取块大小，必须是正整数
+  attachment: true # true 作为附件下载；false 内联展示须另行审查主动内容风险
+
+# ==================== 日期工具配置 ====================
+datetime:
+  timezone: Asia/Shanghai # 日期工具的本地时区；DATETIME_TIMEZONE 可覆盖，不决定数据库存储时区
+  format: "%Y-%m-%d %H:%M:%S" # 日期时间默认格式
+  date_format: "%Y-%m-%d" # 日期标签格式
+  time_format: "%H:%M:%S" # 每日时间窗口的输入格式
+  month_format: "%Y-%m" # 月份标签格式
+  year_format: "%Y" # 年份标签格式
+  max_range_segments: 10000 # 单次日期范围拆分的最大段数
+
+# ==================== 受限表达式配置 ====================
+expression:
+  enabled: false # 按需显式开启；仅支持受限表达式，不执行任意代码或模板语句
+  max_length: 2000 # 模板字符数上限
+  max_context_bytes: 65536 # 上下文 JSON 字节上限
+  max_output_bytes: 65536 # 输出字节上限；不能替代进程的 CPU/内存限制
+  max_depth: 20 # 语法和数据的最大嵌套深度
+
+# ==================== Granian 引擎配置 ====================
+# 由 server.engine 选择引擎；也可通过 --server uvicorn 显式覆盖。
+granian:
+  workers: 1 # 工作进程数，至少为 1；热重载时实际使用单进程
+  threads: 1 # 非热重载模式下的运行线程数，至少为 1
+
+# ==================== Uvicorn 引擎配置 ====================
+uvicorn:
+  workers: 1 # 工作进程数，至少为 1；热重载时实际使用单进程
+  log_level: info # 引擎日志级别：critical/error/warning/info/debug/trace
