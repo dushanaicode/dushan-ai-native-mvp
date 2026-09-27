@@ -1,0 +1,138 @@
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
+
+from framework.common.contracts import SnowflakeIdStr
+from framework.common.exception import ServiceException
+from framework.common.page import PageResult, PageSettings
+from framework.common.schemas.request import IdReqVO
+from framework.common.utils import ConversionUtils
+from framework.starter_di.public import (
+    DiDependency,
+)
+from framework.starter_excel.public import (
+    DictDataProvider,
+    ExcelProviders,
+    ExcelWriter,
+)
+from framework.starter_security.public import (
+    SecurityRealm,
+)
+from framework.starter_web.public import (
+    FileResult,
+    RequestUtils,
+    Result,
+    RoutePolicy,
+)
+from module_infra.controller.admin.mq.vo.mq.mq_consumer_resp_vo import MqConsumerRespVO
+from module_infra.controller.admin.mq.vo.mq.mq_export_req_vo import MqExportReqVO
+from module_infra.controller.admin.mq.vo.mq.mq_page_req_vo import MqPageReqVO
+from module_infra.controller.admin.mq.vo.mq.mq_resp_vo import MqRespVO
+from module_infra.controller.admin.mq.vo.mq.mq_save_req_vo import MqSaveReqVO
+from module_infra.dal.dataobject.mq.mq_do import MqDO
+from module_infra.definitions.constants.error_code_constants import ErrorCodeConstants
+from module_infra.service.mq.mq_definition_service import MqDefinitionService
+
+mq_controller = APIRouter(prefix="/mq", tags=["Infra - MQ 消息定义管理"])
+
+
+class MqController:
+    @staticmethod
+    @mq_controller.get("/consumers", summary="查询已部署的消费者声明")
+    @RoutePolicy(
+        permissions=("infra:mq:query", "infra:mq:create", "infra:mq:update"),
+        permission_mode="any",
+        realm=SecurityRealm.ACCOUNT,
+    )
+    async def get_registered_consumers(
+        service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[list[MqConsumerRespVO]]:
+        return Result.success(await service.get_registered_consumers())
+
+    @staticmethod
+    @mq_controller.post("/create", summary="创建消息定义")
+    @RoutePolicy(permissions=("infra:mq:create",), realm=SecurityRealm.ACCOUNT)
+    async def create_mq_definition(
+        create_req_vo: MqSaveReqVO,
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[SnowflakeIdStr]:
+        definition_id = await mq_definition_service.create_mq_definition(create_req_vo)
+        return Result.success(data=definition_id)
+
+    @staticmethod
+    @mq_controller.put("/update", summary="更新消息定义")
+    @RoutePolicy(permissions=("infra:mq:update",), realm=SecurityRealm.ACCOUNT)
+    async def update_mq_definition(
+        update_req_vo: MqSaveReqVO,
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[bool]:
+        await mq_definition_service.update_mq_definition(update_req_vo)
+        return Result.success(data=True)
+
+    @staticmethod
+    @mq_controller.delete("/delete", summary="删除消息定义")
+    @RoutePolicy(permissions=("infra:mq:delete",), realm=SecurityRealm.ACCOUNT)
+    async def delete_mq_definition(
+        req_vo: IdReqVO = Query(),
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[bool]:
+        await mq_definition_service.delete_mq_definition(req_vo.id)
+        return Result.success(data=True)
+
+    @staticmethod
+    @mq_controller.get("/get", summary="获得消息定义")
+    @RoutePolicy(permissions=("infra:mq:query",), realm=SecurityRealm.ACCOUNT)
+    async def get_mq_definition(
+        req_vo: IdReqVO = Query(),
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[MqRespVO]:
+        definition = await mq_definition_service.get_mq_definition(req_vo.id)
+        if not definition:
+            raise ServiceException(ErrorCodeConstants.MQ_DEFINITION_NOT_EXISTS)
+        resp = MqRespVO.model_validate(definition)
+        return Result.success(data=resp)
+
+    @staticmethod
+    @mq_controller.get("/page", summary="获得消息定义分页")
+    @RoutePolicy(permissions=("infra:mq:query",), realm=SecurityRealm.ACCOUNT)
+    async def get_mq_definition_page(
+        request: Request,
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+    ) -> Result[PageResult[MqRespVO]]:
+        page_req_vo = RequestUtils.validate_with_auto_list_params(request, MqPageReqVO)
+        page_result: PageResult[MqDO] = await mq_definition_service.get_mq_definition_page(
+            page_req_vo
+        )
+        resp_vo: PageResult[MqRespVO] = page_result.convert(MqRespVO)
+        return Result.success(data=resp_vo)
+
+    @staticmethod
+    @mq_controller.get("/export-fields", summary="获取消息定义可导出字段列表")
+    @RoutePolicy(permissions=("infra:mq:export",), realm=SecurityRealm.ACCOUNT)
+    async def get_export_mq_fields() -> Result[list[dict[str, str]]]:
+        export_fields = ExcelWriter.export_fields(MqRespVO)
+        return Result.success(data=export_fields)
+
+    @staticmethod
+    @mq_controller.get("/export-excel", summary="导出消息定义", response_class=StreamingResponse)
+    @RoutePolicy(permissions=("infra:mq:export",), realm=SecurityRealm.ACCOUNT)
+    async def export_mq_definition_list(
+        page_req_vo: MqExportReqVO = Query(),
+        mq_definition_service: MqDefinitionService = Depends(DiDependency(MqDefinitionService)),
+        excel_writer: ExcelWriter = Depends(DiDependency(ExcelWriter)),
+        page_settings: PageSettings = Depends(DiDependency(PageSettings)),
+        files: FileResult = Depends(DiDependency(FileResult)),
+        dictionaries: DictDataProvider = Depends(DiDependency(DictDataProvider)),
+    ) -> StreamingResponse:
+        excel_providers = ExcelProviders(dictionaries=dictionaries)
+        page_req_vo.enable_fetch_all(
+            max_rows=min(excel_writer.settings.max_export_rows, page_settings.fetch_all_max_rows)
+        )
+        page_result: PageResult[MqDO] = await mq_definition_service.get_mq_definition_page(
+            page_req_vo
+        )
+        excel_list: list[MqRespVO] = ConversionUtils.list_to_vo_list(page_result.items, MqRespVO)
+        filename = "消息定义数据"
+        file_data = await excel_writer.write(
+            "数据", MqRespVO, excel_list, providers=excel_providers, fields=page_req_vo.fields
+        )
+        return files.excel_stream(file_data, file_name=f"{filename}.xlsx")

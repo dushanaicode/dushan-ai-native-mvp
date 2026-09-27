@@ -1,0 +1,391 @@
+-- DuShan AI Native MVP 0.0.0; upstream cd21ddf29ea8d3f7134c31eca1b903cac959da75
+
+-- 由无租户模型在 MySQL 8.4.11 上生成；普通业务、数据权限与审计能力保持。
+
+SET NAMES utf8mb4;
+
+SET FOREIGN_KEY_CHECKS=0;
+
+CREATE TABLE `infra_api_access_log` (
+  `trace_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '链路追踪编号',
+  `user_id` bigint DEFAULT NULL COMMENT '用户编号',
+  `user_type` smallint NOT NULL COMMENT '用户类型（枚举）【UserTypeEnum】',
+  `application_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '应用名',
+  `request_method` varchar(10) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '请求方法名',
+  `request_url` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '访问地址',
+  `request_params` json DEFAULT NULL COMMENT '请求参数 (JSON格式)',
+  `response_body` json DEFAULT NULL COMMENT '响应结果 (JSON格式)',
+  `user_ip` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户 IP',
+  `user_agent` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '浏览器 UA',
+  `operate_module` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '操作模块',
+  `operate_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '操作名',
+  `operate_type` int NOT NULL COMMENT '操作分类（枚举类型）【OperateTypeEnum】',
+  `begin_time` datetime NOT NULL COMMENT '开始请求时间',
+  `end_time` datetime NOT NULL COMMENT '结束请求时间',
+  `duration` int NOT NULL COMMENT '执行时长，单位：毫秒',
+  `result_code` int NOT NULL COMMENT '结果码',
+  `result_msg` varchar(512) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '结果提示',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='API 访问日志表';
+
+CREATE TABLE `infra_api_error_log` (
+  `trace_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '链路追踪编号',
+  `user_id` bigint DEFAULT NULL COMMENT '用户编号',
+  `user_type` smallint NOT NULL COMMENT '用户类型（枚举）【UserTypeEnum】',
+  `application_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '应用名',
+  `request_method` varchar(10) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '请求方法名',
+  `request_url` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '访问地址',
+  `request_params` json DEFAULT NULL COMMENT '请求参数 (JSON格式)',
+  `user_ip` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户 IP',
+  `user_agent` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '浏览器 UA',
+  `exception_time` datetime NOT NULL COMMENT '异常发生时间',
+  `exception_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常名',
+  `exception_message` varchar(512) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常导致的消息',
+  `exception_root_cause_message` varchar(512) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常导致的根消息',
+  `exception_stack_trace` text COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常的栈轨迹',
+  `exception_class_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常发生的类全名',
+  `exception_file_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常发生的类文件',
+  `exception_method_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '异常发生的方法名',
+  `exception_line_number` bigint NOT NULL COMMENT '异常发生的方法所在行',
+  `process_status` smallint NOT NULL COMMENT '处理状态',
+  `process_time` datetime DEFAULT NULL COMMENT '处理时间',
+  `process_user_id` bigint DEFAULT NULL COMMENT '处理用户编号',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='API 错误日志表';
+
+CREATE TABLE `infra_codegen_column` (
+  `table_id` bigint NOT NULL COMMENT '表编号',
+  `column_name` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '字段列名',
+  `column_comment` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '字段描述',
+  `data_type` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '字段物理类型',
+  `column_size` bigint DEFAULT NULL COMMENT '字段长度',
+  `field_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Python字段类型',
+  `field_name` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Python属性名',
+  `create_operation` tinyint(1) NOT NULL COMMENT '是否参与新增操作',
+  `update_operation` tinyint(1) NOT NULL COMMENT '是否参与编辑操作',
+  `list_operation` tinyint(1) NOT NULL COMMENT '是否作为查询条件',
+  `list_operation_result` tinyint(1) NOT NULL COMMENT '是否在列表中展示',
+  `list_operation_condition` varchar(20) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '查询方式: =, !=, >, >=, <, <=, LIKE, BETWEEN',
+  `nullable` tinyint(1) NOT NULL COMMENT '是否允许为空',
+  `html_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '显示类型: input, textarea, select, radio, checkbox, datetime, imageUpload, fileUpload, editor',
+  `dict_type` varchar(200) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '关联字典类型',
+  `example` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '示例值',
+  `order_no` smallint NOT NULL COMMENT '排序',
+  `primary_key` tinyint(1) NOT NULL COMMENT '是否主键',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `computed_expression` text COLLATE utf8mb4_unicode_ci COMMENT '数据库生成列表达式',
+  `computed_persisted` tinyint(1) DEFAULT NULL COMMENT '生成列是否持久化',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_codegen_column_active_0` (`table_id`,`column_name`,`active_key`),
+  CONSTRAINT `fk_infra_codegen_column_table_id` FOREIGN KEY (`table_id`) REFERENCES `infra_codegen_table` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='代码生成-列定义';
+
+CREATE TABLE `infra_codegen_table` (
+  `data_source_config_id` bigint NOT NULL COMMENT '数据源配置编号',
+  `table_name` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '表名称',
+  `table_comment` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '表描述',
+  `class_name` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '实体类名称',
+  `author` varchar(100) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '作者',
+  `remark` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '备注',
+  `template_type` smallint NOT NULL COMMENT '模板类型: 1=CRUD, 2=Tree, 15=主子表',
+  `front_type` smallint NOT NULL COMMENT '前端类型',
+  `scene` smallint NOT NULL COMMENT '生成场景',
+  `parent_menu_id` bigint DEFAULT NULL COMMENT '父菜单编号',
+  `module_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '模块名，如 system、infra',
+  `business_name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '业务名，如 user、dict',
+  `class_comment` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '类描述，如 用户',
+  `enable_export` tinyint(1) NOT NULL COMMENT '是否启用导出',
+  `tree_parent_column_id` bigint DEFAULT NULL COMMENT '树表-父字段编号',
+  `tree_name_column_id` bigint DEFAULT NULL COMMENT '树表-名称字段编号',
+  `master_table_id` bigint DEFAULT NULL COMMENT '主子表-主表编号',
+  `sub_join_column_id` bigint DEFAULT NULL COMMENT '主子表-子表关联字段编号',
+  `sub_join_many` tinyint(1) DEFAULT NULL COMMENT '主子表-关联关系: true=一对多, false=一对一',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_codegen_table_active_0` (`data_source_config_id`,`table_name`,`active_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='代码生成-表定义';
+
+CREATE TABLE `infra_config_data` (
+  `type_id` bigint NOT NULL COMMENT '配置类型ID',
+  `name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '参数名称',
+  `key` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '参数键名',
+  `value` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '参数键值',
+  `description` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '配置描述',
+  `input_type` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'UI控件类型',
+  `input_props` text COLLATE utf8mb4_unicode_ci COMMENT 'UI控件属性JSON',
+  `sort` int NOT NULL COMMENT '显示顺序',
+  `visible` int NOT NULL COMMENT '是否可见',
+  `remark` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '备注',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_config_data_active_0` (`key`,`active_key`),
+  KEY `fk_infra_config_data_type_id` (`type_id`),
+  CONSTRAINT `fk_infra_config_data_type_id` FOREIGN KEY (`type_id`) REFERENCES `infra_config_type` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='参数配置表';
+
+CREATE TABLE `infra_config_type` (
+  `module` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '所属模块标识',
+  `name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '配置类型名称',
+  `code` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '配置类型编码',
+  `status` smallint NOT NULL COMMENT '状态（1-启用，0-禁用）',
+  `remark` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '备注',
+  `deleted_time` datetime DEFAULT NULL COMMENT '删除时间',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_config_type_active_0` (`code`,`active_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='配置类型表';
+
+CREATE TABLE `infra_data_source_config` (
+  `name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '数据源名称',
+  `url` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '数据源连接URL',
+  `status` smallint NOT NULL COMMENT '状态：1-启用，0-禁用',
+  `db_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '数据库类型',
+  `source_type` smallint NOT NULL COMMENT '数据源类型：1-主库，2-从库',
+  `is_default` tinyint(1) NOT NULL COMMENT '是否默认数据源',
+  `pool_size` smallint NOT NULL COMMENT '连接池大小',
+  `max_overflow` smallint NOT NULL COMMENT '最大溢出连接数',
+  `pool_recycle` smallint NOT NULL COMMENT '连接最大复用时间（秒）',
+  `pool_timeout` smallint NOT NULL COMMENT '获取连接最大等待时间（秒）',
+  `echo` tinyint(1) NOT NULL COMMENT '是否开启SQL日志',
+  `remark` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '备注',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `default_active` smallint GENERATED ALWAYS AS ((case when ((`deleted` = 0) and (`is_default` = 1)) then 1 else NULL end)) VIRTUAL COMMENT '有效默认配置唯一标记',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_data_source_config_default_active` (`source_type`,`default_active`),
+  UNIQUE KEY `uq_infra_data_source_config_active_0` (`name`,`active_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据源配置表';
+
+CREATE TABLE `infra_file` (
+  `config_id` bigint NOT NULL COMMENT '配置编号',
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '原文件名',
+  `original_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '原始文件名',
+  `path` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '路径，即文件名',
+  `storage_path` varchar(1000) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '实际存储路径',
+  `url` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '访问地址',
+  `type` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '文件的 MIME 类型',
+  `size` int NOT NULL COMMENT '文件大小',
+  `hash` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '文件哈希值',
+  `file_metadata` json DEFAULT NULL COMMENT '文件元数据',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `fk_infra_file_config_id` (`config_id`),
+  CONSTRAINT `fk_infra_file_config_id` FOREIGN KEY (`config_id`) REFERENCES `infra_file_config` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='文件表';
+
+CREATE TABLE `infra_file_config` (
+  `name` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '配置名',
+  `storage` int NOT NULL COMMENT '存储器（枚举类型）',
+  `remark` text COLLATE utf8mb4_unicode_ci COMMENT '备注',
+  `status` smallint NOT NULL COMMENT '状态（1-启用，0-禁用）',
+  `master` tinyint(1) NOT NULL COMMENT '是否为主配置',
+  `config` json NOT NULL COMMENT '文件客户端配置',
+  `master_active` smallint GENERATED ALWAYS AS ((case when ((`deleted` = 0) and (`master` = 1)) then 1 else NULL end)) VIRTUAL COMMENT '有效默认配置唯一标记',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_file_config_master_active` (`master_active`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='文件配置表';
+
+CREATE TABLE `infra_file_content` (
+  `config_id` bigint NOT NULL COMMENT '配置编号',
+  `path` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '路径，即文件名',
+  `content` longblob NOT NULL COMMENT '文件内容',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_file_content_active_0` (`config_id`,`path`,`active_key`),
+  CONSTRAINT `fk_infra_file_content_config_id` FOREIGN KEY (`config_id`) REFERENCES `infra_file_config` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='文件内容表';
+
+CREATE TABLE `infra_job` (
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '任务名称',
+  `status` int NOT NULL COMMENT '任务状态，枚举 【JobStatusEnum】',
+  `handler_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '处理器的名字',
+  `handler_param` varchar(512) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '处理器的参数',
+  `cron_expression` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'CRON 表达式',
+  `retry_count` int NOT NULL COMMENT '重试次数，如果不重试，则设置为 0',
+  `retry_interval` int NOT NULL COMMENT '重试间隔，单位：毫秒，如果没有间隔，则设置为 0',
+  `monitor_timeout` int DEFAULT NULL COMMENT '监控超时时间，单位：毫秒，为空时，表示不监控',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `revision` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '计划版本',
+  `effective_at` datetime NOT NULL COMMENT '版本生效时间 UTC',
+  `parameters` json NOT NULL COMMENT '经过 handler 参数模型验证的值',
+  `max_instances` int NOT NULL COMMENT '最大并发数',
+  `timeout_seconds` float NOT NULL COMMENT '单次执行上限',
+  `retry_backoff` float NOT NULL COMMENT '重试退避倍率',
+  `stop_after_failure` tinyint(1) NOT NULL COMMENT '失败后停止匹配版本',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_job_active_0` (`handler_name`,`active_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='定时任务 DO';
+
+CREATE TABLE `infra_job_log` (
+  `job_id` bigint NOT NULL COMMENT '任务编号，关联 JobDO.id',
+  `handler_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '处理器的名字，冗余字段 JobDO.handler_name',
+  `handler_param` varchar(512) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '处理器的参数，冗余字段 JobDO.handler_param',
+  `execute_index` int NOT NULL COMMENT '第几次执行，用于区分是不是重试执行。如果是重试执行，则 index 大于 1',
+  `begin_time` datetime DEFAULT NULL COMMENT '开始执行时间',
+  `end_time` datetime DEFAULT NULL COMMENT '结束执行时间',
+  `duration` int DEFAULT NULL COMMENT '执行时长，单位：毫秒',
+  `status` int NOT NULL COMMENT '状态，枚举 【JobLogStatusEnum】',
+  `result` varchar(4096) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '结果数据，成功时是执行结果，失败时是异常堆栈',
+  `request_id` varchar(128) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '持久执行请求编号',
+  `state` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Native 执行终态',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_infra_job_log_request_id` (`request_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='定时任务的执行日志';
+
+CREATE TABLE `infra_job_request` (
+  `request_id` varchar(128) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '跨进程幂等请求编号',
+  `job_id` bigint NOT NULL COMMENT '任务编号',
+  `request` json NOT NULL COMMENT 'Native JobRequest 快照',
+  `state` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'pending/claimed/执行终态',
+  `owner` varchar(128) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '独占调度 owner',
+  `ready_at` datetime NOT NULL COMMENT '允许领取时间 UTC',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `request_id` (`request_id`),
+  KEY `ix_infra_job_request_job_id` (`job_id`),
+  KEY `ix_infra_job_request_state` (`state`),
+  KEY `ix_infra_job_request_ready_at` (`ready_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='调度器持久协调记录';
+
+CREATE TABLE `infra_job_schedule` (
+  `job_id` bigint NOT NULL COMMENT '任务编号',
+  `checkpoint` datetime NOT NULL COMMENT '永久定时投递游标；不随历史请求清理',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `job_id` (`job_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='调度器持久协调记录';
+
+CREATE TABLE `infra_job_signal` (
+  `revision` bigint NOT NULL COMMENT '任务定义提交后的合并通知版本',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='调度器持久协调记录';
+
+CREATE TABLE `infra_mq` (
+  `topic` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '消息主题 Topic',
+  `consumer` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '消费者名称，即处理函数名',
+  `retry_count` int NOT NULL COMMENT '重试次数',
+  `description` varchar(512) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT '描述',
+  `active_key` smallint GENERATED ALWAYS AS ((case when (`deleted` = 0) then 1 else NULL end)) VIRTUAL COMMENT '仅有效记录参与业务唯一约束',
+  `enabled` tinyint(1) NOT NULL COMMENT '部署覆盖开关',
+  `concurrency` int DEFAULT NULL COMMENT '部署覆盖并发数',
+  `prefetch` int DEFAULT NULL COMMENT '部署覆盖预取数',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_infra_mq_active_0` (`consumer`,`active_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='MQ 消息的定义';
+
+CREATE TABLE `infra_mq_log` (
+  `message_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '消息ID',
+  `topic` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '消息主题',
+  `consumer` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '消费者名称，冗余字段',
+  `execute_index` int NOT NULL COMMENT '第几次消费，用于区分是不是重试消费。如果是重试，则 index 大于 1',
+  `begin_time` datetime DEFAULT NULL COMMENT '开始消费时间',
+  `end_time` datetime DEFAULT NULL COMMENT '结束消费时间',
+  `duration` int DEFAULT NULL COMMENT '消费时长，单位：毫秒',
+  `status` int NOT NULL COMMENT '状态，枚举 MqLogStatusEnum',
+  `result` text COLLATE utf8mb4_unicode_ci COMMENT '结果数据，成功时是执行结果，失败时是异常堆栈',
+  `payload` json DEFAULT NULL COMMENT '仅留空字段承接历史表结构；不记录正文或身份凭证',
+  `state` varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'Native 消费终态',
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `creator` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `create_time` datetime NOT NULL,
+  `updater` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `update_time` datetime NOT NULL,
+  `deleted` tinyint(1) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_infra_mq_log_topic` (`topic`),
+  KEY `ix_infra_mq_log_message_id` (`message_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='MQ 消息的消费日志';
+
+SET FOREIGN_KEY_CHECKS=1;
