@@ -34,6 +34,6 @@ jobs:
           trap 'rm -f "$TMPDIR/key"' EXIT
           printf '%s\n' "$GITEE_SSH_PRIVATE_KEY" > "$TMPDIR/key"
           printf '%s\n' 'gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN' > "$TMPDIR/known_hosts"
-          export GIT_SSH_COMMAND="ssh -i $TMPDIR/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$TMPDIR/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $TMPDIR/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$TMPDIR/known_hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
           git clone --bare https://github.com/dushanaicode/dushan-ai-native-mvp.git "$TMPDIR/repository.git"
           git -C "$TMPDIR/repository.git" push git@gitee.com:dushan-ai/dushan-ai-native-mvp.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
